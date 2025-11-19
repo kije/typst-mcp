@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "typst": {
+      "command": "uv",
+      "args": ["run", "typst-mcp"]
+    }
+  }
+}

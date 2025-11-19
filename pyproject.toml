@@ -1,11 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "typst-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Typst MCP Server - MCP implementation for Typst interactions with AI models"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Johannes Brandenburger" }
+]
+keywords = ["mcp", "typst", "ai", "llm", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "mcp[cli]==1.8.0",
     "numpy>=2.2.4",
     "pillow>=11.2.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/johannesbrandenburger/typst-mcp"
+Repository = "https://github.com/johannesbrandenburger/typst-mcp"
+Issues = "https://github.com/johannesbrandenburger/typst-mcp/issues"
+
+[project.scripts]
+typst-mcp = "typst_mcp.server:main"
+typst-mcp-build = "typst_mcp.build_docs:main"
+
+[tool.setuptools]
+packages = ["typst_mcp"]
+
+[tool.setuptools.package-data]
+typst_mcp = ["py.typed"]

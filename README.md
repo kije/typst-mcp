@@ -28,38 +28,226 @@ The server provides the following tools:
    - Before sending complex Typst illustrations to the user, the LLM should render the code to an image and check if it looks correct.
    - Only relevant for multi modal models.
 
-## Getting Started
+## Installation
 
-- Clone this repository
-  - `git clone https://github.com/johannesbrandenburger/typst-mcp.git`
-- Clone the [typst repository](https://github.com/typst/typst.git)
-  - `git clone https://github.com/typst/typst.git`
-- Run the docs generation in the typst repository
-  - `cargo run --package typst-docs -- --assets-dir ../typst-mcp/typst-docs --out-file ../typst-mcp/typst-docs/main.json`
-    - Make sure to adjust the path to your local clone of the typst-mcp repository
-    - This will generate the `main.json` and the assets in the `typst-docs` folder
-- Install required dependencies: `uv sync` (install [uv](https://github.com/astral-sh/uv) if not already installed)
-  
-- Install Typst
+### Prerequisites
+
+Before installing the MCP server, ensure you have the following tools installed:
+
+- **Rust and Cargo** (for building Typst documentation): [Install Rust](https://rustup.rs/)
+- **Typst CLI** (for syntax validation and image generation): [Install Typst](https://github.com/typst/typst)
+- **Pandoc** (for LaTeX to Typst conversion): [Install Pandoc](https://pandoc.org/installing.html)
+
+**Quick install (macOS):**
+```bash
+brew install rust typst pandoc
+```
+
+**Quick install (Linux):**
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install Typst and Pandoc (Ubuntu/Debian)
+apt install typst pandoc
+
+# Or use your distribution's package manager
+```
+
+### Option 1: Using uvx (Recommended for End Users)
+
+The easiest way to use this MCP server is via `uvx`. **No manual setup required** - the server automatically builds documentation on first run:
+
+```bash
+# Just run the server - it handles everything automatically!
+uvx typst-mcp
+```
+
+**Configure in Claude Desktop or other MCP clients:**
+
+Add to your MCP configuration file (e.g., `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "typst": {
+      "command": "uvx",
+      "args": ["typst-mcp"]
+    }
+  }
+}
+```
+
+**That's it!** The first time you run it, the server will:
+1. Check if documentation exists
+2. If not, automatically build it (takes 1-2 minutes, one-time only)
+3. Start the MCP server
+
+On subsequent runs, it starts instantly since docs are already built.
+
+### Option 2: Development Installation
+
+For development or contributing:
+
+```bash
+# Clone the repository
+git clone https://github.com/johannesbrandenburger/typst-mcp.git
+cd typst-mcp
+
+# Initialize the typst submodule
+git submodule update --init --depth=1
+
+# Install dependencies
+uv sync
+
+# Run the server (builds docs automatically if needed)
+uv run typst-mcp
+```
+
+**Or install locally with pip/uv:**
+
+```bash
+# Install in editable mode
+uv pip install -e .
+
+# Run server (builds docs automatically if needed)
+typst-mcp
+```
+
+**Manual documentation build** (optional, for rebuilding):
+
+```bash
+# Force rebuild documentation
+typst-mcp-build
+```
 
 ## Running the Server
 
-Execute the server script:
+### Standalone Mode
+
+Execute the server directly (automatically builds docs on first run):
 
 ```bash
-python server.py
+# Using uvx (recommended)
+uvx typst-mcp
+
+# Or if installed locally
+typst-mcp
+
+# Or using Python module
+python -m typst_mcp.server
 ```
 
-Or install it in Claude Desktop with MCP:
+**Note:** The server automatically checks for and builds documentation on startup. The first run takes 1-2 minutes for the build, subsequent runs start instantly.
+
+### MCP Client Configuration
+
+#### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "typst": {
+      "command": "uvx",
+      "args": ["typst-mcp"]
+    }
+  }
+}
+```
+
+#### VS Code with Agent Mode
+
+Configure in your VS Code MCP settings. See: [Agent mode in VS Code](https://code.visualstudio.com/blogs/2025/04/07/agentMode)
+
+#### Using mcp CLI
 
 ```bash
-mcp install server.py
+mcp install typst-mcp
 ```
 
-Or use the new agent mode in VS Code:
+## Architecture
 
-[Agent mode: available to all users and supports MCP](https://code.visualstudio.com/blogs/2025/04/07/agentMode)
+The project is structured as follows:
+
+```
+typst-mcp/
+├── typst_mcp/              # Python package
+│   ├── __init__.py         # Package initialization
+│   ├── server.py           # MCP server implementation
+│   └── build_docs.py       # Documentation build script
+├── vendor/                 # Git submodules
+│   └── typst/              # Typst source repository (submodule)
+├── typst-docs/             # Generated documentation (gitignored)
+│   ├── main.json           # Documentation JSON
+│   └── assets/             # Documentation assets
+├── pyproject.toml          # Package configuration
+├── README.md               # This file
+└── LICENSE                 # MIT License
+```
+
+## How It Works
+
+1. **Automatic Setup**: On first run, the server checks if documentation exists. If not, it automatically builds it from the Typst source repository (included as a submodule). This is a one-time process.
+
+2. **Documentation Generation**: Uses the Typst source via Cargo to generate comprehensive, up-to-date documentation in JSON format with all function signatures, examples, and descriptions.
+
+3. **Smart Caching**: When using `uvx`, both the package and generated documentation are cached in the uvx environment. Subsequent runs start instantly without rebuilding.
+
+4. **Runtime Dependencies**: The server checks for required tools (`typst`, `pandoc`) on startup and provides helpful installation instructions if any are missing.
+
+## Troubleshooting
+
+### Documentation build issues
+
+The server automatically builds documentation on first run. If the automatic build fails:
+
+**Check Rust version** (requires Rust 1.89+):
+```bash
+rustc --version  # Should show 1.89 or higher
+rustup update    # Update if needed
+```
+
+**Manually rebuild documentation:**
+```bash
+# Using uvx
+uvx --from typst-mcp typst-mcp-build
+
+# Or if installed locally
+typst-mcp-build
+```
+
+### Missing external tools
+
+If you see warnings about missing `typst` or `pandoc`:
+
+- **macOS**: `brew install typst pandoc`
+- **Linux**: `apt install typst pandoc` (or equivalent for your distribution)
+- **Windows**: See installation links in Prerequisites section
+
+### Submodule not initialized
+
+If the typst submodule is missing:
+
+```bash
+git submodule update --init --depth=1 vendor/typst
+```
 
 ## JSON Schema of the Typst Documentation
 
 >⚠️ The schema of the typst documentation is not stable and may change at any time. The schema is generated from the typst source code and is not guaranteed to be complete or correct. If the schema changes, this repository will need to be updated accordingly, so that the docs functionality works again.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- [Typst](https://github.com/typst/typst) - The amazing typesetting system
+- [MCP](https://github.com/modelcontextprotocol) - Model Context Protocol
+- [Pandoc](https://pandoc.org/) - Universal document converter
