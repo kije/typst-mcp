@@ -1,0 +1,48 @@
+name: Update Typst Submodule
+
+on:
+  schedule:
+    # Run weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  update-submodule:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update submodule and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Store current commit
+          cd vendor/typst
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+
+          # Update to latest
+          cd ../..
+          git submodule update --remote vendor/typst
+
+          # Check new commit
+          cd vendor/typst
+          NEW_COMMIT=$(git rev-parse HEAD)
+
+          # Commit and push if there are changes
+          cd ../..
+          if [ "$CURRENT_COMMIT" != "$NEW_COMMIT" ]; then
+            echo "Updated from $CURRENT_COMMIT to $NEW_COMMIT"
+            git add vendor/typst
+            git commit -m "chore: update typst submodule to $NEW_COMMIT"
+            git push
+          else
+            echo "No updates available"
+          fi
