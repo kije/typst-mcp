@@ -1,4 +1,6 @@
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import EmbeddedResource, BlobResourceContents, AnyUrl
+import base64
 import json
 import subprocess
 import os
@@ -11,7 +13,8 @@ from pathlib import Path
 from PIL import Image as PILImage
 import io
 import numpy as np
-from typing import Optional
+from typing import Optional, Literal
+from datetime import datetime
 
 temp_dir = tempfile.mkdtemp()
 
@@ -172,6 +175,43 @@ def list_child_routes(chapter: dict) -> list[dict]:
             )
         child_routes += list_child_routes(child)
     return child_routes
+
+
+def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> EmbeddedResource:
+    """
+    Creates an MCP EmbeddedResource containing a PDF file.
+
+    Args:
+        pdf_bytes: Raw PDF binary data
+        name: Filename for the PDF resource (default: document.pdf)
+
+    Returns:
+        EmbeddedResource with BlobResourceContents containing base64-encoded PDF
+    """
+    return EmbeddedResource(
+        type="resource",
+        resource=BlobResourceContents(
+            uri=AnyUrl(f"file:///{name}"),
+            mimeType="application/pdf",
+            blob=base64.b64encode(pdf_bytes).decode('ascii')
+        )
+    )
+
+
+def get_pdf_output_dir() -> Path:
+    """
+    Get the output directory for PDF files in path mode.
+
+    Uses system temp directory for automatic OS-level cleanup.
+    Files are temporary and will be cleaned up by the OS.
+
+    Returns:
+        Path to the PDF output directory (in /tmp or platform equivalent)
+    """
+    # Use system temp directory - OS handles cleanup automatically
+    pdf_dir = Path(tempfile.gettempdir()) / "typst-mcp-pdf"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    return pdf_dir
 
 
 @mcp.tool()
@@ -603,6 +643,116 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
         return f"ERROR: in typst_to_image. Failed to convert typst to image. Error message from typst: {error_message}"
+
+
+@mcp.tool()
+def typst_snippet_to_pdf(
+    typst_snippet: str,
+    output_mode: Literal["embedded", "path"] = "embedded"
+) -> EmbeddedResource | str:
+    r"""
+    Converts Typst code to a PDF document using the typst command line tool.
+    Handles multi-page documents naturally (PDF format supports multiple pages).
+
+    The LLM should use this to generate PDF documents from Typst code.
+    Useful for creating complete documents, reports, or presentations.
+
+    Args:
+        typst_snippet: Typst code to compile to PDF
+        output_mode: How to return the PDF:
+            - "embedded" (default): Returns EmbeddedResource with base64-encoded PDF
+            - "path": Saves PDF to cache directory and returns absolute file path
+
+    Returns:
+        - If output_mode="embedded": EmbeddedResource containing base64-encoded PDF
+        - If output_mode="path": String with absolute path to saved PDF file
+        - If error: String starting with "ERROR:" describing the failure
+
+    Output modes:
+        - "embedded": Best for small-medium PDFs, works with all MCP clients,
+                      data embedded in response (~33% size overhead from base64)
+        - "path": Best for large PDFs or file-based workflows, returns file path,
+                  no size overhead, files saved to system temp directory (/tmp),
+                  OS handles cleanup automatically
+
+    Example 1 - Simple document (embedded):
+    ```typst
+    #set page(paper: "a4")
+    #set text(font: "New Computer Modern")
+
+    = Introduction
+    This is a sample PDF document.
+    ```
+
+    Example 2 - Multi-page document (path mode):
+    ```python
+    # Request with path output
+    typst_snippet_to_pdf(typst_code, output_mode="path")
+    # Returns: "/tmp/typst-mcp-pdf/document_20250120_143022_abc123.pdf"
+    # Note: Files are temporary and cleaned up by OS
+    ```
+
+    Example 3 - Large document (use path mode):
+    ```typst
+    #set page(paper: "us-letter")
+
+    = Chapter 1
+    Content for page 1...
+
+    #pagebreak()
+
+    = Chapter 2
+    Content for page 2...
+    ```
+    """
+
+    # Create unique temporary directory for this request (thread-safe)
+    with tempfile.TemporaryDirectory() as request_temp_dir:
+        typ_file = os.path.join(request_temp_dir, "main.typ")
+        pdf_file = os.path.join(request_temp_dir, "output.pdf")
+
+        # Write snippet to temp file with explicit UTF-8 encoding
+        with open(typ_file, "w", encoding="utf-8") as f:
+            f.write(typst_snippet)
+
+        try:
+            # Compile to PDF
+            subprocess.run(
+                ["typst", "compile", typ_file, pdf_file],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # Read PDF bytes
+            with open(pdf_file, "rb") as f:
+                pdf_bytes = f.read()
+
+            # Return based on output mode
+            if output_mode == "path":
+                # Save to persistent output directory
+                output_dir = get_pdf_output_dir()
+
+                # Generate unique filename with timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
+                output_path = output_dir / unique_name
+
+                # Write PDF to output location
+                with open(output_path, "wb") as f:
+                    f.write(pdf_bytes)
+
+                # Return absolute path
+                return str(output_path.absolute())
+
+            else:  # embedded mode (default)
+                # Return as MCP EmbeddedResource with base64 encoding
+                return create_pdf_resource(pdf_bytes)
+
+        except subprocess.CalledProcessError as e:
+            error_message = e.stderr.strip() if e.stderr else "Unknown error"
+            return f"ERROR: in typst_snippet_to_pdf. Failed to compile Typst to PDF. Error: {error_message}"
 
 
 # ============================================================================
