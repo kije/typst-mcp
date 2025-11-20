@@ -5,6 +5,8 @@ import os
 import tempfile
 import shutil
 import sys
+import threading
+import time
 from pathlib import Path
 from PIL import Image as PILImage
 import io
@@ -13,6 +15,15 @@ import numpy as np
 temp_dir = tempfile.mkdtemp()
 
 mcp = FastMCP("Typst MCP Server")
+
+# Global state for lazy-loaded docs
+_docs_state = {
+    "loaded": False,
+    "building": False,
+    "error": None,
+    "docs": None,
+    "lock": threading.Lock()
+}
 
 
 def eprint(*args, **kwargs):
@@ -45,52 +56,104 @@ def check_dependencies():
         eprint("=" * 60 + "\n")
 
 
-def ensure_docs_built():
-    """
-    Ensure Typst documentation is built before starting the server.
-    If docs don't exist, automatically build them.
-    Returns the path to the docs JSON file.
-    """
+def build_docs_background():
+    """Build documentation in background thread."""
     from .build_docs import build_typst_docs, get_cache_dir
 
-    # Use cache directory for persistent storage across uvx runs
-    cache_dir = get_cache_dir()
-    docs_dir = cache_dir / "typst-docs"
-    docs_json = docs_dir / "main.json"
+    with _docs_state["lock"]:
+        if _docs_state["loaded"] or _docs_state["building"]:
+            return
+        _docs_state["building"] = True
 
-    if not docs_json.exists():
+    try:
+        cache_dir = get_cache_dir()
+        docs_dir = cache_dir / "typst-docs"
+        docs_json = docs_dir / "main.json"
+
+        # Check if docs already exist
+        if docs_json.exists():
+            eprint("✓ Loading existing Typst documentation...")
+            with open(docs_json, "r", encoding="utf-8") as f:
+                docs_data = json.loads(f.read())
+
+            with _docs_state["lock"]:
+                _docs_state["docs"] = docs_data
+                _docs_state["loaded"] = True
+                _docs_state["building"] = False
+            eprint("✓ Documentation loaded successfully")
+            return
+
+        # Build docs if they don't exist
         eprint("\n" + "=" * 60)
-        eprint("Typst documentation not found - building automatically...")
+        eprint("Typst documentation not found - building in background...")
         eprint("=" * 60)
-        eprint("(This is a one-time process that may take 1-2 minutes)\n")
+        eprint("(This is a one-time process that may take 1-2 minutes)")
+        eprint("Note: Non-doc tools are available immediately!\n")
 
-        # Build the docs
         success = build_typst_docs()
 
         if not success:
+            with _docs_state["lock"]:
+                _docs_state["error"] = "Failed to build documentation"
+                _docs_state["building"] = False
             eprint("\n" + "=" * 60)
             eprint("ERROR: Failed to build documentation automatically.")
-            eprint("=" * 60)
-            eprint("\nPlease try building manually:")
-            eprint("  uvx --from typst-mcp typst-mcp-build")
+            eprint("Documentation-related tools will not be available.")
             eprint("=" * 60 + "\n")
-            sys.exit(1)
+            return
+
+        # Load the built docs
+        with open(docs_json, "r", encoding="utf-8") as f:
+            docs_data = json.loads(f.read())
+
+        with _docs_state["lock"]:
+            _docs_state["docs"] = docs_data
+            _docs_state["loaded"] = True
+            _docs_state["building"] = False
 
         eprint("\n" + "=" * 60)
-        eprint("Documentation built successfully!")
+        eprint("Documentation built and loaded successfully!")
+        eprint("All tools are now available.")
         eprint("=" * 60 + "\n")
 
-    return docs_json
+    except Exception as e:
+        with _docs_state["lock"]:
+            _docs_state["error"] = str(e)
+            _docs_state["building"] = False
+        eprint(f"\n ERROR building docs: {e}\n")
 
 
-# Ensure docs are built and get the path
-typst_docs_path = ensure_docs_built()
+def get_docs(wait_seconds=5):
+    """
+    Get the typst docs, waiting if they're being built.
+    Returns docs or raises error if not available.
+    """
+    # If already loaded, return immediately
+    if _docs_state["loaded"]:
+        return _docs_state["docs"]
 
-# Load the typst docs JSON file
-raw_typst_docs = ""
-with open(typst_docs_path, "r", encoding="utf-8") as f:
-    raw_typst_docs = f.read()
-typst_docs = json.loads(raw_typst_docs)
+    # If building, wait briefly
+    if _docs_state["building"]:
+        eprint(f"Waiting for documentation to finish building (max {wait_seconds}s)...")
+        start = time.time()
+        while time.time() - start < wait_seconds:
+            time.sleep(0.5)
+            if _docs_state["loaded"]:
+                return _docs_state["docs"]
+
+        # Still building after wait
+        raise RuntimeError(
+            "Documentation is still building. This typically takes 1-2 minutes on first run. "
+            "Please try again in a moment. Non-documentation tools (LaTeX conversion, "
+            "syntax validation, image rendering) are available immediately."
+        )
+
+    # Not loaded and not building - check for error
+    if _docs_state["error"]:
+        raise RuntimeError(f"Documentation failed to build: {_docs_state['error']}")
+
+    # Should not reach here, but handle gracefully
+    raise RuntimeError("Documentation not available. Please restart the server.")
 
 
 def list_child_routes(chapter: dict) -> list[dict]:
@@ -115,7 +178,13 @@ def list_docs_chapters() -> str:
     Lists all chapters in the typst docs.
     The LLM should use this in the beginning to get the list of chapters and then decide which chapter to read.
     """
-    eprint("mcp.resource('docs://chapters') called")
+    eprint("mcp.tool('list_docs_chapters') called")
+
+    try:
+        typst_docs = get_docs(wait_seconds=10)
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
     chapters = []
     for chapter in typst_docs:
         chapters.append(
@@ -136,7 +205,12 @@ def get_docs_chapter(route: str) -> str:
     If a chapter has children and its content length is over 1000, this will only return the child routes
     instead of the full content to avoid overwhelming responses.
     """
-    eprint(f"mcp.resource('docs://chapters/{route}') called")
+    eprint(f"mcp.tool('get_docs_chapter') called with route: {route}")
+
+    try:
+        typst_docs = get_docs(wait_seconds=10)
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
 
     # the rout could also be in the form of "____reference____layout____colbreak" -> "/reference/layout/colbreak"
     # replace all underscores with slashes
@@ -175,11 +249,7 @@ def get_docs_chapter(route: str) -> str:
 
     # Check if chapter has children and is large
     content_length = len(json.dumps(found_chapter))
-    if (
-        "children" in found_chapter
-        and len(found_chapter["children"]) > 0
-        and content_length > 1000
-    ):
+    if "children" in found_chapter and len(found_chapter["children"]) > 0 and content_length > 1000:
         # Return just the child routes instead of full content
         child_routes = []
         for child in found_chapter["children"]:
@@ -500,9 +570,7 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
         total_height = sum(page.height for page in pages)
 
         # Create a new image with the combined dimensions
-        combined_image = PILImage.new(
-            "RGB", (total_width, total_height), (255, 255, 255)
-        )
+        combined_image = PILImage.new("RGB", (total_width, total_height), (255, 255, 255))
 
         # Paste all pages vertically
         y_offset = 0
@@ -529,187 +597,18 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
         return f"ERROR: in typst_to_image. Failed to convert typst to image. Error message from typst: {error_message}"
 
 
-# =============================================================================
-# RESOURCES - For clients that support them (e.g., Claude Desktop)
-# =============================================================================
-
-
-@mcp.resource("typst://docs/index")
-def docs_index_resource() -> str:
-    """
-    Index of all available Typst documentation resources.
-    Useful for discovering what documentation is available.
-    """
-    return json.dumps(
-        {
-            "resources": [
-                {
-                    "uri": "typst://docs/chapters",
-                    "name": "Documentation Chapters List",
-                    "description": "Complete list of all documentation chapters with routes and sizes",
-                    "mimeType": "application/json",
-                },
-                {
-                    "uri": "typst://docs/chapter/{route}",
-                    "name": "Documentation Chapter",
-                    "description": "Individual chapter content by route (use ____ as path separator)",
-                    "mimeType": "application/json",
-                },
-            ],
-            "note": "If your client doesn't support resources, use the equivalent tools instead.",
-        }
-    )
-
-
-@mcp.resource("typst://docs/chapters")
-def list_docs_chapters_resource() -> str:
-    """
-    Lists all chapters in the Typst documentation.
-    Returns a JSON array of all available documentation chapters with their routes and content sizes.
-    """
-    chapters = []
-    for chapter in typst_docs:
-        chapters.append(
-            {"route": chapter["route"], "content_length": len(json.dumps(chapter))}
-        )
-        chapters += list_child_routes(chapter)
-    return json.dumps(chapters)
-
-
-@mcp.resource("typst://docs/chapter/{route}")
-def get_docs_chapter_resource(route: str) -> str:
-    """
-    Gets a specific chapter from the Typst documentation by route.
-
-    The route uses underscores (____) as path separators instead of slashes.
-
-    Example URIs:
-    - typst://docs/chapter/reference____layout____colbreak
-    - typst://docs/chapter/reference____text____text
-    """
-    # Reuse the existing tool implementation
-    return get_docs_chapter(route)
-
-
-# =============================================================================
-# PROMPTS - Workflow templates for common tasks
-# =============================================================================
-
-
-@mcp.prompt()
-def latex_to_typst_conversion_prompt():
-    """
-    Guides the user through converting LaTeX code to Typst.
-    Useful for converting existing LaTeX documents or snippets to Typst format.
-    """
-    return {
-        "name": "latex-to-typst-conversion",
-        "description": "Convert LaTeX code to Typst with validation",
-        "arguments": [
-            {
-                "name": "latex_code",
-                "description": "The LaTeX code to convert",
-                "required": True,
-            }
-        ],
-    }
-
-
-@mcp.prompt()
-def create_typst_document_prompt():
-    """
-    Helps create a new Typst document from scratch.
-    Provides guidance on document structure and common patterns.
-    """
-    return {
-        "name": "create-typst-document",
-        "description": "Create a new Typst document with proper structure",
-        "arguments": [
-            {
-                "name": "document_type",
-                "description": "Type of document (article, report, presentation, etc.)",
-                "required": True,
-            },
-            {
-                "name": "requirements",
-                "description": "Specific requirements or content to include",
-                "required": False,
-            },
-        ],
-    }
-
-
-@mcp.prompt()
-def fix_typst_syntax_prompt():
-    """
-    Helps troubleshoot and fix Typst syntax errors.
-    Analyzes error messages and suggests corrections.
-    """
-    return {
-        "name": "fix-typst-syntax",
-        "description": "Troubleshoot and fix Typst syntax errors",
-        "arguments": [
-            {
-                "name": "typst_code",
-                "description": "The Typst code with syntax errors",
-                "required": True,
-            },
-            {
-                "name": "error_message",
-                "description": "The error message from Typst compiler (if available)",
-                "required": False,
-            },
-        ],
-    }
-
-
-@mcp.prompt()
-def generate_typst_figure_prompt():
-    """
-    Helps create figures, diagrams, or mathematical expressions in Typst.
-    Can convert from LaTeX or create from description.
-    """
-    return {
-        "name": "generate-typst-figure",
-        "description": "Create a figure, diagram, or mathematical expression in Typst",
-        "arguments": [
-            {
-                "name": "description",
-                "description": "Description of what to create",
-                "required": True,
-            },
-            {
-                "name": "latex_reference",
-                "description": "Optional LaTeX code as reference",
-                "required": False,
-            },
-        ],
-    }
-
-
-@mcp.prompt()
-def typst_best_practices_prompt():
-    """
-    Provides guidance on Typst best practices and common patterns.
-    Useful for learning how to write idiomatic Typst code.
-    """
-    return {
-        "name": "typst-best-practices",
-        "description": "Learn Typst best practices and common patterns",
-        "arguments": [
-            {
-                "name": "topic",
-                "description": "Specific topic or feature to learn about (layout, styling, math, etc.)",
-                "required": False,
-            }
-        ],
-    }
-
-
 def main():
     """Entry point for the MCP server."""
     # Check dependencies on startup
     check_dependencies()
+
+    # Start background thread to build/load docs
+    eprint("Starting Typst MCP Server...")
+    eprint("Tools available immediately: latex_snippet_to_typst, check_if_snippet_is_valid_typst_syntax, typst_snippet_to_image")
+    eprint("Documentation tools will be available after docs are loaded/built...\n")
+
+    doc_thread = threading.Thread(target=build_docs_background, daemon=True)
+    doc_thread.start()
 
     # Run the server
     mcp.run()

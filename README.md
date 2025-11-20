@@ -108,12 +108,20 @@ Add to your MCP configuration file (e.g., `claude_desktop_config.json`):
 }
 ```
 
-**That's it!** The first time you run it, the server will:
-1. Check if documentation exists
-2. If not, automatically build it (takes 1-2 minutes, one-time only)
-3. Start the MCP server
+**That's it!** The server uses **progressive disclosure** for maximum responsiveness:
 
-On subsequent runs, it starts instantly since docs are already built.
+**Immediate startup** (< 1 second):
+- Server starts and responds to MCP initialization immediately
+- **LaTeX conversion**, **syntax validation**, and **image rendering** tools are available instantly
+- No timeout issues with MCP clients
+
+**Background documentation loading**:
+- Documentation loads/builds in a background thread
+- Documentation query tools become available once loaded
+- If docs need building (first run): takes 1-2 minutes in background
+- If docs already exist: loads in ~1 second
+
+This means **most tools work immediately** even on first run!
 
 ### Option 2: Development Installation
 
@@ -223,23 +231,30 @@ typst-mcp/
 
 ## How It Works
 
-1. **Automatic Setup**: On first run, the server checks if documentation exists in the cache directory. If not, it automatically:
+1. **Progressive Tool Disclosure (Lazy Loading)**:
+   - Server starts **immediately** (< 1 second) and responds to MCP initialization
+   - **Non-doc tools available instantly**: LaTeX conversion, syntax validation, image rendering
+   - **Doc tools load in background**: Documentation loading/building happens in a separate thread
+   - **No client timeouts**: MCP clients never timeout waiting for initialization
+
+2. **Automatic Documentation Setup**: In the background, the server checks if documentation exists in the cache directory. If not, it automatically:
    - Clones the Typst repository to the cache
    - Builds documentation from source
    - Stores everything in a persistent cache directory
+   - **All while non-doc tools remain available**
 
-2. **Documentation Generation**: Uses the Typst source via Cargo to generate comprehensive, up-to-date documentation in JSON format with all function signatures, examples, and descriptions.
+3. **Documentation Generation**: Uses the Typst source via Cargo to generate comprehensive, up-to-date documentation in JSON format with all function signatures, examples, and descriptions.
 
-3. **Smart Caching & Auto-Updates**:
+4. **Smart Caching & Auto-Updates**:
    - Documentation is stored in platform-specific cache directories
    - Persists across `uvx` runs and system updates
    - **Automatic version tracking**: Tracks the Typst repository version used to build docs
    - **Auto-rebuild**: Automatically detects and rebuilds when a new Typst version is available
    - Subsequent server starts with same version are instant
 
-4. **MCP Compatibility**: All build output goes to stderr, keeping stdout clean for JSON-RPC communication with MCP clients.
+5. **MCP Compatibility**: All build output goes to stderr, keeping stdout clean for JSON-RPC communication with MCP clients.
 
-5. **Runtime Dependencies**: The server checks for required tools (`typst`, `pandoc`) on startup and provides helpful installation instructions if any are missing.
+6. **Runtime Dependencies**: The server checks for required tools (`typst`, `pandoc`) on startup and provides helpful installation instructions if any are missing.
 
 ## Troubleshooting
 
