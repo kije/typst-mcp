@@ -208,6 +208,76 @@ uvx typst-mcp --disable-sandbox
 
 **Note:** Pandoc `--sandbox` and timeouts remain active even when opted out.
 
+### Fail-Safe Behavior (Sandboxing Required on Linux/macOS)
+
+**IMPORTANT:** On Linux and macOS, the server will **refuse to start** if sandboxing is unavailable (unless explicitly disabled with `--disable-sandbox`).
+
+**Why:** Sandboxing is essential for security on platforms that support it. Running without sandboxing on Linux/macOS creates unacceptable risk.
+
+**What happens:**
+- **Linux/macOS without Node.js:** Server exits with error message
+- **Linux/macOS with `--disable-sandbox`:** Server runs with warning (not recommended)
+- **Windows:** Server runs with warning (WSL2/Docker recommended)
+
+**Error message example:**
+```
+❌ FATAL: Sandboxing unavailable
+Platform: Linux
+Sandboxing is required on Linux/macOS for security.
+
+Possible causes:
+  • Node.js not installed (required for npx)
+  • @anthropic-ai/sandbox-runtime not available
+  • Network issues preventing npx download
+
+To fix:
+  1. Install Node.js: https://nodejs.org/
+  2. Verify npx works: npx --version
+  3. Or install globally: npm install -g @anthropic-ai/sandbox-runtime
+
+To bypass (NOT RECOMMENDED for untrusted code):
+  uvx typst-mcp --disable-sandbox
+```
+
+This fail-safe design prevents accidental security bypasses.
+
+### Automatic Cleanup (Privacy & Disk Management)
+
+The server automatically cleans up temporary files to prevent information leakage and disk exhaustion:
+
+**Temporary Directory Cleanup:**
+- Global temp directory is cleaned up on server shutdown
+- Prevents accumulation of LaTeX/Typst snippets
+- Uses `atexit` handler for automatic cleanup
+
+**PDF Cleanup:**
+- PDFs older than 24 hours are automatically deleted
+- All PDFs are deleted on server shutdown
+- PDF files are created with owner-only permissions (mode 0600)
+
+**File Permissions:**
+- Generated PDFs have mode 0600 (owner read/write only)
+- Prevents other users on multi-tenant systems from reading files
+- Protects sensitive documents on shared systems
+
+### Input Validation (Path Traversal Protection)
+
+All user inputs to package fetching tools are validated to prevent path traversal attacks:
+
+**Protected inputs:**
+- `package_name`: Must match `^[a-z0-9][a-z0-9-]*$` (lowercase letters, numbers, hyphens only)
+- `version`: Must be valid semantic versioning (e.g., `1.0.0` or `1.0.0-beta.1`)
+- `file_path`: Cannot contain `..`, absolute paths, or null bytes
+
+**Example:**
+```python
+# These are BLOCKED:
+get_package_versions("../../../evil/repo")  # ValueError: Path traversal detected
+fetch_file_from_github("cetz", "../../..", "README.md")  # ValueError: Invalid version format
+```
+
+This prevents SSRF attacks via GitHub URL manipulation.
+
 ### Custom Sandbox Rules
 
 You can customize sandbox behavior via environment variables and command-line flags:
@@ -324,12 +394,17 @@ uvx typst-mcp
 ✅ **Credentials** cannot be exfiltrated
 ✅ **DoS attacks** are prevented via timeouts
 ✅ **Pandoc exploits** are mitigated
+✅ **Path traversal attacks** are blocked via input validation (package fetching)
+✅ **Information leakage** is prevented via automatic file cleanup
+✅ **File permission leaks** on multi-tenant systems (mode 0600 for PDFs)
+✅ **Accidental security bypass** prevented by fail-safe behavior (Linux/macOS)
 
 ### What is NOT Protected
 
 ❌ **Local file references** - User can still read project files (by design)
 ❌ **CPU/Memory exhaustion** - Monitored but not hard-limited (platform-dependent)
 ❌ **Side-channel attacks** - Not addressed
+❌ **Symlink attacks** - Relies on srt/OS-level sandbox (trusted by design)
 
 ### Threat Model
 
