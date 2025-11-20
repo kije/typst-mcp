@@ -316,6 +316,88 @@ Configure in your VS Code MCP settings. See: [Agent mode in VS Code](https://cod
 mcp install typst-mcp
 ```
 
+## Security
+
+typst-mcp implements multiple security layers to safely execute external commands on user-provided code. See [SECURITY.md](SECURITY.md) for comprehensive details.
+
+### Quick Overview
+
+**Automatic Sandboxing** (Zero-Setup):
+- ✅ **macOS/Linux**: Full OS-level sandboxing via [Anthropic Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime)
+- ✅ **Auto-installed**: If Node.js/npx is present, sandboxing auto-downloads on first run
+- ✅ **Manual install**: `npm install -g @anthropic-ai/sandbox-runtime`
+- ⚠️ **Windows**: Use WSL2 or Docker for sandboxing (see docs/ADVANCED_SETUP.md)
+
+**Security Layers:**
+1. **Filesystem isolation**: Blocks reads to `~/.ssh`, `~/.aws`, credentials; allows project files
+2. **Network restrictions**: Only `packages.typst.org` and package sources
+3. **Pandoc --sandbox**: CVE mitigation (requires Pandoc ≥ 3.1.4)
+4. **Process timeouts**: 30-60 second limits prevent DoS
+
+**Configuration** (optional):
+```bash
+# Disable sandboxing (command-line only for security)
+uvx typst-mcp --disable-sandbox
+
+# Read whitelist mode (command-line only for security)
+uvx typst-mcp --read-allow-only "/path1,/path2,/path3"
+
+# Custom rules via environment variables (additive to defaults)
+export TYPST_MCP_DENY_READ="~/.private,/secret"        # Block additional paths (blacklist mode only)
+export TYPST_MCP_ALLOW_WRITE="~/build,/var/log/typst" # Allow writing to specific dirs
+export TYPST_MCP_ALLOW_DOMAINS="fonts.googleapis.com"  # Allow additional domains
+```
+
+**Security Notes:**
+- `--disable-sandbox` and `--read-allow-only` are command-line flags ONLY (not ENV variables)
+- This prevents malicious code from disabling security or expanding allowed paths
+- There is no `TYPST_MCP_ALLOW_READ` or `TYPST_MCP_DISABLE_SANDBOX` environment variable
+
+**Windows Users:**
+For full sandboxing on Windows, use WSL2:
+```powershell
+wsl --install -d Ubuntu
+# Then inside WSL2: pip install typst-mcp
+```
+
+Or configure Claude Desktop to use WSL2:
+```json
+{
+  "mcpServers": {
+    "typst": {
+      "command": "wsl",
+      "args": ["uvx", "typst-mcp"]
+    }
+  }
+}
+```
+
+**Status on Startup:**
+```
+✅ Sandboxing enabled (Anthropic Sandbox Runtime)
+```
+
+Or without sandboxing:
+```
+ℹ️  Enhanced Security Available (Optional)
+Current security measures:
+  ✓ Pandoc --sandbox flag
+  ✓ 30-60 second timeouts
+  ✓ Isolated temp directory
+```
+
+**Local File References Work:**
+```typst
+// ✅ User's project files are accessible
+#image("../assets/logo.png")
+#include("templates/article.typ")
+
+// ❌ Sensitive files are blocked
+#include("~/.ssh/id_rsa")  // Blocked by sandbox
+```
+
+For full security documentation, threat model, and implementation details, see [SECURITY.md](SECURITY.md).
+
 ## Architecture
 
 The project is structured as follows:

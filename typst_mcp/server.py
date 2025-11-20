@@ -16,6 +16,9 @@ import numpy as np
 from typing import Optional, Literal
 from datetime import datetime
 
+# Import sandbox module
+from . import sandbox
+
 temp_dir = tempfile.mkdtemp()
 
 mcp = FastMCP("Typst MCP Server")
@@ -389,7 +392,7 @@ def latex_snippet_to_typst(latex_snippet) -> str:
 
     # run the pandoc command line tool and capture error output
     try:
-        result = subprocess.run(
+        result = sandbox.run_sandboxed(
             [
                 "pandoc",
                 "--sandbox",  # SECURITY: Prevent arbitrary file operations (CVE mitigation)
@@ -476,7 +479,7 @@ def check_if_snippet_is_valid_typst_syntax(typst_snippet) -> str:
         f.write(typst_snippet)
     # run the typst command line tool and capture the result
     try:
-        subprocess.run(
+        sandbox.run_sandboxed(
             ["typst", "compile", os.path.join(temp_dir, "main.typ")],
             check=True,
             stdout=subprocess.PIPE,
@@ -557,7 +560,7 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
 
     # run the typst command line tool and capture the result
     try:
-        subprocess.run(
+        sandbox.run_sandboxed(
             [
                 "typst",
                 "compile",
@@ -679,7 +682,13 @@ def typst_snippet_to_pdf(
             - "path": Saves PDF to disk and returns absolute file path
         output_path: Optional custom filepath for saving PDF (only used with output_mode="path").
                      If not provided, generates automatic filename in temp directory.
-                     Parent directory must exist.
+
+                     SECURITY: For security reasons, output_path must be within allowed directories:
+                     - Current working directory (where MCP server was started)
+                     - System temp directory (platform-specific)
+                     - Any custom directories set via TYPST_MCP_ALLOW_WRITE environment variable
+
+                     If you need to write outside these directories, use output_mode="embedded" instead.
 
     Returns:
         - If output_mode="embedded": Image object containing PDF binary data
@@ -688,10 +697,11 @@ def typst_snippet_to_pdf(
 
     Output modes:
         - "embedded": Best for small-medium PDFs, returns embedded resource object with PDF data
-        - "path": Best for large PDFs or file-based workflows, returns file path,
-                  no size overhead, files saved to temp directory (or custom path)
+                      No filesystem restrictions - PDF data returned directly
+        - "path": Best for large PDFs or file-based workflows, returns file path
+                  Subject to filesystem security restrictions (see output_path docs)
 
-    Example 1 - Simple document (embedded):
+    Example 1 - Simple document (embedded mode - recommended):
     ```typst
     #set page(paper: "a4")
     #set text(font: "New Computer Modern")
@@ -700,19 +710,23 @@ def typst_snippet_to_pdf(
     This is a sample PDF document.
     ```
 
-    Example 2 - Path mode with auto-generated filename:
+    Example 2 - Path mode with auto-generated filename (always allowed):
     ```python
     typst_snippet_to_pdf(typst_code, output_mode="path")
     # Returns: "/tmp/typst-mcp-pdf/document_20250120_143022_abc123.pdf"
     ```
 
-    Example 3 - Path mode with custom filepath:
+    Example 3 - Path mode with custom filepath (must be in allowed directory):
     ```python
+    # ✅ Works if current directory is /home/user/project
+    typst_snippet_to_pdf(typst_code, output_mode="path", output_path="/home/user/project/my_doc.pdf")
+
+    # ❌ Fails if /home/user is NOT an allowed directory
     typst_snippet_to_pdf(typst_code, output_mode="path", output_path="/home/user/my_doc.pdf")
-    # Returns: "/home/user/my_doc.pdf"
+    # ERROR: Output path not in allowed directories
     ```
 
-    Example 4 - Large document (use path mode):
+    Example 4 - Large document (use path mode with auto-generated name):
     ```typst
     #set page(paper: "us-letter")
 
@@ -724,6 +738,11 @@ def typst_snippet_to_pdf(
     = Chapter 2
     Content for page 2...
     ```
+
+    Security Notes:
+    - Typst compilation runs in a sandbox (cannot access sensitive files)
+    - PDF output is restricted to allowed directories for additional protection
+    - Use embedded mode if you need maximum flexibility (no filesystem access)
     """
 
     # Create unique temporary directory for this request (thread-safe)
@@ -737,7 +756,7 @@ def typst_snippet_to_pdf(
 
         try:
             # Compile to PDF
-            subprocess.run(
+            sandbox.run_sandboxed(
                 ["typst", "compile", typ_file, pdf_file],
                 check=True,
                 stdout=subprocess.PIPE,
@@ -754,23 +773,54 @@ def typst_snippet_to_pdf(
             if output_mode == "path":
                 # Determine output path
                 if output_path:
-                    # Use custom filepath (parent must exist)
+                    # Use custom filepath (must be absolute)
                     final_path = Path(output_path).absolute()
 
-                    # Validate parent directory exists
-                    if not final_path.parent.exists():
-                        return f"ERROR: Parent directory does not exist: {final_path.parent}"
+                    # SECURITY: Use sandboxed copy instead of Python file I/O
+                    # This ensures sandbox restrictions are enforced by the OS, not our code
+                    # Avoids vulnerabilities: symlinks, path traversal, race conditions, etc.
+
+                    try:
+                        # Use secure_copy_file (cross-platform, sandbox-enforced)
+                        sandbox.secure_copy_file(pdf_file, str(final_path), timeout=10)
+
+                    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
+                        # Sandbox blocked the operation or copy failed
+                        if isinstance(e, subprocess.CalledProcessError):
+                            error_msg = e.stderr.strip() if e.stderr else "Permission denied or path not allowed"
+                        else:
+                            error_msg = str(e)
+
+                        # Get allowed directories for helpful error message
+                        from . import sandbox as sandbox_module
+                        sb = sandbox_module.get_sandbox()
+                        allowed_dirs = sb.config.allow_write if sb and sb.config else []
+
+                        return (
+                            f"ERROR: Could not write PDF to requested location.\n"
+                            f"Requested: {final_path}\n"
+                            f"Error: {error_msg}\n\n"
+                            f"Allowed write directories (enforced by OS sandbox):\n" +
+                            "\n".join(f"  - {d}" for d in allowed_dirs) +
+                            "\n\nFor security reasons, PDFs can only be written to:\n"
+                            "  1. Current working directory (where server started)\n"
+                            "  2. System temp directory\n"
+                            "  3. Custom directories via TYPST_MCP_ALLOW_WRITE environment variable\n"
+                            "  4. Use output_mode='embedded' to get PDF data directly (no restrictions)"
+                        )
 
                 else:
-                    # Generate automatic filename in temp directory
+                    # Generate automatic filename in temp directory (always allowed)
                     output_dir = get_pdf_output_dir()
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
                     final_path = output_dir / unique_name
 
-                # Write PDF to output location
-                with open(final_path, "wb") as f:
-                    f.write(pdf_bytes)
+                    # Copy using sandboxed copy (even though temp dir is always allowed)
+                    try:
+                        sandbox.secure_copy_file(pdf_file, str(final_path), timeout=10)
+                    except Exception as e:
+                        return f"ERROR: Failed to copy PDF to temp directory: {e}"
 
                 # Return absolute path as string
                 return str(final_path)
@@ -1733,8 +1783,12 @@ def main():
     # Check dependencies on startup
     check_dependencies()
 
+    # Initialize sandboxing
+    eprint("Initializing security sandbox...")
+    sandbox.initialize_sandbox(temp_dir)
+
     # Start background thread to build/load docs
-    eprint("Starting Typst MCP Server...")
+    eprint("\nStarting Typst MCP Server...")
     eprint("\nTools available immediately:")
     eprint("  - LaTeX conversion: latex_snippet_to_typst, latex_snippets_to_typst")
     eprint(
