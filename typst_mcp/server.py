@@ -211,19 +211,52 @@ def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> list:
     ]
 
 
+def cleanup_old_pdfs(directory: Path, max_age_hours: int = 24):
+    """Remove PDF files older than max_age_hours.
+
+    Args:
+        directory: Directory containing PDFs
+        max_age_hours: Maximum age in hours before deletion (0 = delete all)
+    """
+    import time
+
+    if not directory.exists():
+        return
+
+    cutoff_time = time.time() - (max_age_hours * 3600)
+    cleaned_count = 0
+
+    try:
+        for pdf_file in directory.glob("*.pdf"):
+            try:
+                if pdf_file.stat().st_mtime < cutoff_time:
+                    pdf_file.unlink()
+                    cleaned_count += 1
+            except Exception as e:
+                eprint(f"Warning: Could not delete {pdf_file.name}: {e}")
+
+        if cleaned_count > 0:
+            eprint(f"✓ Cleaned up {cleaned_count} old PDF(s)")
+    except Exception as e:
+        eprint(f"Warning: PDF cleanup failed: {e}")
+
+
 def get_pdf_output_dir() -> Path:
     """
     Get the output directory for PDF files in path mode.
 
-    Uses system temp directory for automatic OS-level cleanup.
-    Files are temporary and will be cleaned up by the OS.
+    PDFs older than 24 hours are automatically cleaned up.
 
     Returns:
         Path to the PDF output directory (in /tmp or platform equivalent)
     """
-    # Use system temp directory - OS handles cleanup automatically
+    # Use system temp directory
     pdf_dir = Path(tempfile.gettempdir()) / "typst-mcp-pdf"
     pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    # SECURITY: Clean up PDFs older than 24 hours on each access
+    cleanup_old_pdfs(pdf_dir, max_age_hours=24)
+
     return pdf_dir
 
 
@@ -783,6 +816,12 @@ def typst_snippet_to_pdf(
                     try:
                         # Use secure_copy_file (cross-platform, sandbox-enforced)
                         sandbox.secure_copy_file(pdf_file, str(final_path), timeout=10)
+
+                        # SECURITY: Restrict file permissions to owner-only (0600)
+                        try:
+                            os.chmod(final_path, 0o600)
+                        except Exception as chmod_err:
+                            eprint(f"Warning: Could not restrict PDF permissions: {chmod_err}")
 
                     except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
                         # Sandbox blocked the operation or copy failed
@@ -1780,12 +1819,37 @@ Let's explore Typst best practices for {topic}!""",
 
 def main():
     """Entry point for the MCP server."""
+    import atexit
+
     # Check dependencies on startup
     check_dependencies()
 
     # Initialize sandboxing
     eprint("Initializing security sandbox...")
     sandbox.initialize_sandbox(temp_dir)
+
+    # SECURITY: Register cleanup handler for temp_dir
+    def cleanup_temp_dir():
+        """Clean up temporary directory on exit."""
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                eprint(f"✓ Cleaned up temporary directory: {temp_dir}")
+        except Exception as e:
+            eprint(f"Warning: Failed to clean up temp directory: {e}")
+
+    atexit.register(cleanup_temp_dir)
+
+    # SECURITY: Register cleanup handler for PDF directory on exit
+    def cleanup_all_pdfs():
+        """Clean up all PDFs on server shutdown."""
+        try:
+            pdf_dir = Path(tempfile.gettempdir()) / "typst-mcp-pdf"
+            cleanup_old_pdfs(pdf_dir, max_age_hours=0)  # Delete all on shutdown
+        except Exception as e:
+            eprint(f"Warning: Failed to clean up PDFs on exit: {e}")
+
+    atexit.register(cleanup_all_pdfs)
 
     # Start background thread to build/load docs
     eprint("\nStarting Typst MCP Server...")

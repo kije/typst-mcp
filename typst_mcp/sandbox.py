@@ -640,7 +640,50 @@ def initialize_sandbox(temp_dir: str, argv: Optional[List[str]] = None) -> bool:
         eprint("="*60 + "\n")
 
     _sandbox = TypestSandbox(temp_dir, read_allow_only, disable_sandbox)
-    return _sandbox.initialize()
+    sandboxed = _sandbox.initialize()
+
+    # SECURITY: Fail-fast if sandbox unavailable on supported platforms
+    import platform
+    system = platform.system()
+
+    if not sandboxed and not disable_sandbox:
+        if system in ("Linux", "Darwin"):  # macOS = Darwin
+            # Sandbox is REQUIRED on Linux/macOS
+            eprint("\n" + "="*60)
+            eprint("❌ FATAL: Sandboxing unavailable")
+            eprint("="*60)
+            eprint(f"Platform: {system}")
+            eprint("Sandboxing is required on Linux/macOS for security.")
+            eprint("\nPossible causes:")
+            eprint("  • Node.js not installed (required for npx)")
+            eprint("  • @anthropic-ai/sandbox-runtime not available")
+            eprint("  • Network issues preventing npx download")
+            eprint("\nTo fix:")
+            eprint("  1. Install Node.js: https://nodejs.org/")
+            eprint("  2. Verify npx works: npx --version")
+            eprint("  3. Or install globally: npm install -g @anthropic-ai/sandbox-runtime")
+            eprint("\nTo bypass (NOT RECOMMENDED for untrusted code):")
+            eprint("  uvx typst-mcp --disable-sandbox")
+            eprint("="*60 + "\n")
+            raise RuntimeError("Sandboxing unavailable on supported platform")
+        elif system == "Windows":
+            # Windows: Warn but allow (WSL2/Docker is documented solution)
+            eprint("\n" + "="*60)
+            eprint("⚠️  WARNING: Running without sandboxing on Windows")
+            eprint("="*60)
+            eprint("Sandboxing is not natively supported on Windows.")
+            eprint("For production use, please use:")
+            eprint("  • WSL2: wsl --install")
+            eprint("  • Docker: See docs/ADVANCED_SETUP.md")
+            eprint("\nCurrent security:")
+            eprint("  ✓ Pandoc --sandbox flag")
+            eprint("  ✓ Process timeouts")
+            eprint("  ❌ No filesystem restrictions")
+            eprint("  ❌ No network restrictions")
+            eprint("\nThis configuration is NOT recommended for untrusted code.")
+            eprint("="*60 + "\n")
+
+    return sandboxed
 
 
 def get_sandbox() -> Optional[TypestSandbox]:

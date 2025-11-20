@@ -2,6 +2,7 @@
 """Module for fetching and caching Typst Universe package documentation."""
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,96 @@ from .build_docs import get_cache_dir, eprint
 
 # Package cache state
 _package_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def validate_package_name(name: str) -> str:
+    """Validate package name to prevent path traversal and injection attacks.
+
+    Args:
+        name: Package name to validate
+
+    Returns:
+        Validated package name
+
+    Raises:
+        ValueError: If package name is invalid or contains path traversal
+    """
+    # Allow only lowercase letters, numbers, hyphens (standard package naming)
+    if not re.match(r'^[a-z0-9][a-z0-9-]*$', name):
+        raise ValueError(
+            f"Invalid package name format: '{name}'. "
+            "Package names must start with a letter or number and contain only "
+            "lowercase letters, numbers, and hyphens."
+        )
+
+    # Additional safety checks for path traversal
+    if '..' in name or '/' in name or '\\' in name:
+        raise ValueError(f"Path traversal detected in package name: '{name}'")
+
+    # Reasonable length limit
+    if len(name) > 100:
+        raise ValueError(f"Package name too long (max 100 characters): '{name}'")
+
+    return name
+
+
+def validate_version(version: str) -> str:
+    """Validate version string to prevent path traversal.
+
+    Args:
+        version: Version string to validate
+
+    Returns:
+        Validated version string
+
+    Raises:
+        ValueError: If version is invalid or contains path traversal
+    """
+    # Semantic versioning format: X.Y.Z or X.Y.Z-suffix
+    if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$', version):
+        raise ValueError(
+            f"Invalid version format: '{version}'. "
+            "Version must follow semantic versioning (e.g., 1.0.0 or 1.0.0-beta.1)"
+        )
+
+    # Path traversal check
+    if '..' in version or '/' in version or '\\' in version:
+        raise ValueError(f"Path traversal detected in version: '{version}'")
+
+    return version
+
+
+def validate_file_path(path: str) -> str:
+    """Validate file path within package to prevent path traversal.
+
+    Args:
+        path: File path to validate
+
+    Returns:
+        Validated file path
+
+    Raises:
+        ValueError: If path is invalid or contains path traversal
+    """
+    # Prevent absolute paths
+    if path.startswith('/') or path.startswith('\\'):
+        raise ValueError(f"Absolute paths not allowed: '{path}'")
+
+    # Check for path traversal in normalized path
+    normalized = path.replace('\\', '/')
+    parts = normalized.split('/')
+    if '..' in parts:
+        raise ValueError(f"Path traversal detected in file path: '{path}'")
+
+    # Prevent null bytes (can bypass some security checks)
+    if '\x00' in path:
+        raise ValueError("Null bytes in file path not allowed")
+
+    # Reasonable length limit
+    if len(path) > 500:
+        raise ValueError(f"File path too long (max 500 characters): '{path}'")
+
+    return path
 
 
 def get_package_cache_dir() -> Path:
@@ -35,7 +126,11 @@ def get_package_versions(package_name: str, timeout: int = 10) -> list[str]:
 
     Raises:
         RuntimeError: If package not found or request fails
+        ValueError: If package_name contains invalid characters or path traversal
     """
+    # SECURITY: Validate package name to prevent path traversal attacks
+    package_name = validate_package_name(package_name)
+
     url = f"https://api.github.com/repos/typst/packages/contents/packages/preview/{package_name}"
 
     try:
@@ -81,7 +176,15 @@ def fetch_file_from_github(
 
     Returns:
         File content as string, or None if not found
+
+    Raises:
+        ValueError: If inputs contain invalid characters or path traversal
     """
+    # SECURITY: Validate all inputs to prevent path traversal attacks
+    package_name = validate_package_name(package_name)
+    version = validate_version(version)
+    file_path = validate_file_path(file_path)
+
     url = f"https://raw.githubusercontent.com/typst/packages/main/packages/preview/{package_name}/{version}/{file_path}"
 
     try:
@@ -119,7 +222,15 @@ def fetch_directory_listing(
 
     Returns:
         List of file/directory entries with name, path, type
+
+    Raises:
+        ValueError: If inputs contain invalid characters or path traversal
     """
+    # SECURITY: Validate all inputs to prevent path traversal attacks
+    package_name = validate_package_name(package_name)
+    version = validate_version(version)
+    dir_path = validate_file_path(dir_path)
+
     url = f"https://api.github.com/repos/typst/packages/contents/packages/preview/{package_name}/{version}/{dir_path}"
 
     try:
@@ -206,7 +317,11 @@ def get_package_metadata(package_name: str, version: str) -> Dict[str, Any]:
 
     Returns:
         Dictionary containing package metadata
+
+    Raises:
+        ValueError: If inputs contain invalid characters or path traversal
     """
+    # SECURITY: Validation happens in fetch_file_from_github
     toml_content = fetch_file_from_github(package_name, version, "typst.toml")
 
     if not toml_content:
@@ -260,7 +375,13 @@ def build_package_docs(
 
     Raises:
         RuntimeError: If package cannot be fetched or built
+        ValueError: If inputs contain invalid characters or path traversal
     """
+    # SECURITY: Validate package name first
+    package_name = validate_package_name(package_name)
+    if version:
+        version = validate_version(version)
+
     start_time = time.time()
 
     # Check cache first
