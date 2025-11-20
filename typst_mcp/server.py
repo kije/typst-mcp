@@ -696,7 +696,8 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
         return f"ERROR: in typst_to_image. Failed to convert typst to image. Error message from typst: {error_message}"
 
 
-@mcp.tool()
+# NOTE: This tool is registered manually in main() with dynamic description
+# Do not add @mcp.tool() decorator here - it needs runtime sandbox info
 def typst_snippet_to_pdf(
     typst_snippet: str,
     output_mode: Literal["embedded", "path"] = "embedded",
@@ -777,6 +778,8 @@ def typst_snippet_to_pdf(
     - Typst compilation runs in a sandbox (cannot access sensitive files)
     - PDF output is restricted to allowed directories for additional protection
     - Use embedded mode if you need maximum flexibility (no filesystem access)
+
+    {{SANDBOX_PATHS_PLACEHOLDER}}
     """
 
     # Create unique temporary directory for this request (thread-safe)
@@ -1818,6 +1821,55 @@ Let's explore Typst best practices for {topic}!""",
     }
 
 
+def _get_pdf_tool_description():
+    """Generate dynamic tool description with actual sandbox paths."""
+    sb = sandbox.get_sandbox()
+    allowed_dirs = []
+
+    if sb and sb.sandboxed:
+        # Sandbox is enabled - show actual allowed directories
+        allowed_dirs = sb.config.allow_write
+        paths_list = "\n".join(f"       - {d}" for d in allowed_dirs)
+
+        sandbox_section = f"""
+    Sandbox Configuration (ENABLED):
+    The following write locations are currently allowed by the OS-level sandbox:
+{paths_list}
+
+    All other write attempts will be blocked by the sandbox runtime.
+    These paths are enforced at the OS level for maximum security.
+    """
+    elif sb and sb.disabled:
+        # Sandbox explicitly disabled
+        sandbox_section = """
+    Sandbox Configuration (DISABLED):
+    ⚠️  WARNING: Sandbox has been disabled via --disable-sandbox flag.
+    Filesystem restrictions are NOT enforced.
+    This should only be used for debugging or in trusted environments.
+    """
+    else:
+        # Sandbox initialization failed or not available
+        sandbox_section = """
+    Sandbox Configuration (NOT AVAILABLE):
+    Sandboxing could not be initialized on this platform.
+    Basic security measures are in place (timeouts, pandoc --sandbox flag)
+    but filesystem restrictions are NOT enforced.
+    For production use, please use WSL2, Docker, or a supported platform.
+    """
+
+    # Generate the full description by replacing placeholder in docstring
+    base_description = typst_snippet_to_pdf.__doc__ or ""
+    full_description = base_description.replace(
+        "{{SANDBOX_PATHS_PLACEHOLDER}}",
+        sandbox_section
+    )
+
+    if sb and sb.sandboxed:
+        eprint(f"✓ Generated PDF tool description with {len(allowed_dirs)} sandbox paths")
+
+    return full_description
+
+
 def main():
     """Entry point for the MCP server."""
     import atexit
@@ -1828,6 +1880,10 @@ def main():
     # Initialize sandboxing
     eprint("Initializing security sandbox...")
     sandbox.initialize_sandbox(temp_dir)
+
+    # Manually register typst_snippet_to_pdf with dynamic description
+    pdf_description = _get_pdf_tool_description()
+    mcp.tool(typst_snippet_to_pdf, description=pdf_description)
 
     # SECURITY: Register cleanup handler for temp_dir
     def cleanup_temp_dir():
