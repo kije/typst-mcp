@@ -2,11 +2,21 @@
 
 Typst MCP Server is an [MCP (Model Context Protocol)](https://github.com/modelcontextprotocol) implementation that helps AI models interact with [Typst](https://github.com/typst/typst), a markup-based typesetting system. The server provides tools for converting between LaTeX and Typst, validating Typst syntax, and generating images from Typst code.
 
-## Available Tools
+## Available Primitives
 
->⚠️ Currently all the functionality is implemented as `tools`, because Cursor and VS Code are not able to handle the other primitives yet.
+The server implements **multiple MCP primitives** for maximum compatibility and efficiency:
 
-The server provides the following tools:
+| Primitive | Claude Desktop | Claude Code | Cursor | VS Code |
+|-----------|----------------|-------------|--------|---------|
+| **Tools** | ✅ | ✅ | ✅ | ✅ |
+| **Resources** | ✅ | ❌ | ❌ | ❌ |
+| **Prompts** | ✅ | ❌ | ❌ | ❌ |
+
+**Design Philosophy:** The server provides the same functionality via both **Tools** (universal compatibility) and **Resources** (efficient for documentation). Clients automatically use whichever primitives they support.
+
+### Tools
+
+All tools work in every MCP client:
 
 1. **`list_docs_chapters()`**: Lists all chapters in the Typst documentation.
    - Lets the LLM get an overview of the documentation and select a chapter to read.
@@ -24,9 +34,29 @@ The server provides the following tools:
    - Before sending Typst code to the user, the LLM should check if the code is valid.
    - Also available as `check_if_snippets_are_valid_typst_syntax(typst_snippets: list)` for validating multiple Typst snippets at once.
 
-5. **`typst_to_image(typst_snippet)`**: Renders Typst code to a PNG image.
+5. **`typst_snippet_to_image(typst_snippet)`**: Renders Typst code to a PNG image.
    - Before sending complex Typst illustrations to the user, the LLM should render the code to an image and check if it looks correct.
    - Only relevant for multi modal models.
+
+### Resources
+
+Available in **Claude Desktop** for efficient documentation access. Resources provide better caching and semantics for read-only data:
+
+- **`typst://docs/index`**: Index of all available documentation resources
+- **`typst://docs/chapters`**: Complete list of all documentation chapters (same as `list_docs_chapters()` tool)
+- **`typst://docs/chapter/{route}`**: Individual chapter content by route (same as `get_docs_chapter()` tool)
+
+**Note:** If your client supports resources, they will be used automatically for better performance. Otherwise, the equivalent tools are used.
+
+### Prompts
+
+Available in **Claude Desktop** for guided workflows. Prompts provide template-based interactions:
+
+1. **`latex-to-typst-conversion`**: Guided workflow for converting LaTeX code to Typst with validation
+2. **`create-typst-document`**: Help create a new Typst document from scratch with proper structure
+3. **`fix-typst-syntax`**: Troubleshoot and fix Typst syntax errors with error analysis
+4. **`generate-typst-figure`**: Create figures, diagrams, or mathematical expressions in Typst
+5. **`typst-best-practices`**: Learn Typst best practices and common patterns for specific topics
 
 ## Installation
 

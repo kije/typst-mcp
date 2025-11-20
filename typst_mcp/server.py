@@ -529,6 +529,183 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
         return f"ERROR: in typst_to_image. Failed to convert typst to image. Error message from typst: {error_message}"
 
 
+# =============================================================================
+# RESOURCES - For clients that support them (e.g., Claude Desktop)
+# =============================================================================
+
+
+@mcp.resource("typst://docs/index")
+def docs_index_resource() -> str:
+    """
+    Index of all available Typst documentation resources.
+    Useful for discovering what documentation is available.
+    """
+    return json.dumps(
+        {
+            "resources": [
+                {
+                    "uri": "typst://docs/chapters",
+                    "name": "Documentation Chapters List",
+                    "description": "Complete list of all documentation chapters with routes and sizes",
+                    "mimeType": "application/json",
+                },
+                {
+                    "uri": "typst://docs/chapter/{route}",
+                    "name": "Documentation Chapter",
+                    "description": "Individual chapter content by route (use ____ as path separator)",
+                    "mimeType": "application/json",
+                },
+            ],
+            "note": "If your client doesn't support resources, use the equivalent tools instead.",
+        }
+    )
+
+
+@mcp.resource("typst://docs/chapters")
+def list_docs_chapters_resource() -> str:
+    """
+    Lists all chapters in the Typst documentation.
+    Returns a JSON array of all available documentation chapters with their routes and content sizes.
+    """
+    chapters = []
+    for chapter in typst_docs:
+        chapters.append(
+            {"route": chapter["route"], "content_length": len(json.dumps(chapter))}
+        )
+        chapters += list_child_routes(chapter)
+    return json.dumps(chapters)
+
+
+@mcp.resource("typst://docs/chapter/{route}")
+def get_docs_chapter_resource(route: str) -> str:
+    """
+    Gets a specific chapter from the Typst documentation by route.
+
+    The route uses underscores (____) as path separators instead of slashes.
+
+    Example URIs:
+    - typst://docs/chapter/reference____layout____colbreak
+    - typst://docs/chapter/reference____text____text
+    """
+    # Reuse the existing tool implementation
+    return get_docs_chapter(route)
+
+
+# =============================================================================
+# PROMPTS - Workflow templates for common tasks
+# =============================================================================
+
+
+@mcp.prompt()
+def latex_to_typst_conversion_prompt():
+    """
+    Guides the user through converting LaTeX code to Typst.
+    Useful for converting existing LaTeX documents or snippets to Typst format.
+    """
+    return {
+        "name": "latex-to-typst-conversion",
+        "description": "Convert LaTeX code to Typst with validation",
+        "arguments": [
+            {
+                "name": "latex_code",
+                "description": "The LaTeX code to convert",
+                "required": True,
+            }
+        ],
+    }
+
+
+@mcp.prompt()
+def create_typst_document_prompt():
+    """
+    Helps create a new Typst document from scratch.
+    Provides guidance on document structure and common patterns.
+    """
+    return {
+        "name": "create-typst-document",
+        "description": "Create a new Typst document with proper structure",
+        "arguments": [
+            {
+                "name": "document_type",
+                "description": "Type of document (article, report, presentation, etc.)",
+                "required": True,
+            },
+            {
+                "name": "requirements",
+                "description": "Specific requirements or content to include",
+                "required": False,
+            },
+        ],
+    }
+
+
+@mcp.prompt()
+def fix_typst_syntax_prompt():
+    """
+    Helps troubleshoot and fix Typst syntax errors.
+    Analyzes error messages and suggests corrections.
+    """
+    return {
+        "name": "fix-typst-syntax",
+        "description": "Troubleshoot and fix Typst syntax errors",
+        "arguments": [
+            {
+                "name": "typst_code",
+                "description": "The Typst code with syntax errors",
+                "required": True,
+            },
+            {
+                "name": "error_message",
+                "description": "The error message from Typst compiler (if available)",
+                "required": False,
+            },
+        ],
+    }
+
+
+@mcp.prompt()
+def generate_typst_figure_prompt():
+    """
+    Helps create figures, diagrams, or mathematical expressions in Typst.
+    Can convert from LaTeX or create from description.
+    """
+    return {
+        "name": "generate-typst-figure",
+        "description": "Create a figure, diagram, or mathematical expression in Typst",
+        "arguments": [
+            {
+                "name": "description",
+                "description": "Description of what to create",
+                "required": True,
+            },
+            {
+                "name": "latex_reference",
+                "description": "Optional LaTeX code as reference",
+                "required": False,
+            },
+        ],
+    }
+
+
+@mcp.prompt()
+def typst_best_practices_prompt():
+    """
+    Provides guidance on Typst best practices and common patterns.
+    Useful for learning how to write idiomatic Typst code.
+    """
+    return {
+        "name": "typst-best-practices",
+        "description": "Learn Typst best practices and common patterns",
+        "arguments": [
+            {
+                "name": "topic",
+                "description": "Specific topic or feature to learn about (layout, styling, math, etc.)",
+                "required": False,
+            }
+        ],
+    }
+
+
 def main():
     """Entry point for the MCP server."""
     # Check dependencies on startup
