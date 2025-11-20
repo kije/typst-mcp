@@ -38,25 +38,118 @@ All tools work in every MCP client:
    - Before sending complex Typst illustrations to the user, the LLM should render the code to an image and check if it looks correct.
    - Only relevant for multi modal models.
 
+6. **`search_packages(query, max_results=20)`**: Search for packages in Typst Universe.
+   - Search through available Typst packages by name
+   - Returns package info including names, URLs, and import statements
+   - Useful for discovering packages before fetching their documentation
+
+7. **`list_packages()`**: List all available packages in Typst Universe.
+   - Returns a complete list of all packages (900+ packages)
+   - Use `search_packages()` for filtered results
+
+8. **`get_package_versions(package_name)`**: Get available versions for a package.
+   - Fetches all published versions of a package
+   - Versions returned in descending order (latest first)
+   - Example: `get_package_versions("cetz")` → `["0.4.2", "0.4.1", "0.4.0", ...]`
+
+9. **`get_package_docs(package_name, version=None, summary=False)`**: Fetch comprehensive documentation for a Typst Universe package.
+   - **Summary mode** (`summary=True`): Lightweight discovery mode (~88% smaller)
+     - Package metadata with homepage, repository, keywords
+     - README preview (first 500 chars)
+     - File listings for examples/ and docs/ (names and sizes only, no content)
+     - Perfect for discovering package structure efficiently
+   - **Full mode** (`summary=False`, default): Complete documentation
+     - README, LICENSE, CHANGELOG (full content)
+     - All .typ files from examples/ directory with full content
+     - All files from docs/ directory (guides, tutorials, migration docs)
+     - External links (homepage URL like polylux.dev, cetz-package.github.io)
+   - Automatically fetches latest version if not specified
+   - Results are cached locally for fast subsequent access
+   - Example: `get_package_docs("polylux", summary=True)` → 1.8 KB vs 15.5 KB full
+
+10. **`get_package_file(package_name, version, file_path)`**: Fetch a specific file from a package.
+    - Granular access to individual files without fetching all documentation
+    - Use after `get_package_docs(summary=True)` to discover available files
+    - Perfect for targeted retrieval (e.g., fetch one example)
+    - Example: `get_package_file("cetz", "0.2.2", "examples/plot.typ")` → Just that file
+    - ~95% smaller than full package for single file access
+
 ### Resources
 
 Available in **Claude Desktop** for efficient documentation access. Resources provide better caching and semantics for read-only data:
 
+**Typst Core Documentation (RESTORED):**
 - **`typst://docs/index`**: Index of all available documentation resources
 - **`typst://docs/chapters`**: Complete list of all documentation chapters (same as `list_docs_chapters()` tool)
 - **`typst://docs/chapter/{route}`**: Individual chapter content by route (same as `get_docs_chapter()` tool)
+  - Lazy loading: First access may build docs (~1-2 min), subsequent instant (cached)
+  - Example: `typst://docs/chapter/reference____layout____colbreak`
+
+**Dynamic Package Resources (NEW!):**
+- **`typst://packages/cached`**: List of all cached package documentation
+  - Updates automatically as packages are fetched via tools
+  - Shows package names, versions, and resource URIs
+
+**Hierarchical Package Resources:**
+- **`typst://package/{name}/{version}`** - Package summary (metadata + file listings)
+- **`typst://package/{name}/{version}/readme`** - Full README content
+- **`typst://package/{name}/{version}/examples`** - List all example files with URIs
+- **`typst://package/{name}/{version}/examples/{filename}`** - Individual example file
+- **`typst://package/{name}/{version}/docs`** - List all documentation files with URIs
+- **`typst://package/{name}/{version}/docs/{filename}`** - Individual documentation file
+
+**Resource Structure:**
+```
+typst://package/polylux/0.4.0              # Summary
+├── readme                                 # Full README
+├── examples                               # List examples
+│   ├── demo.typ                          # Individual example
+│   └── minimal.typ                       # Individual example
+└── docs                                  # List docs
+    └── guide.md                          # Individual doc
+```
+
+**Lazy Loading (WebDAV-like pattern):**
+1. **Just access resources** - No tool call required!
+   - `typst://package/polylux/0.4.0` - Auto-fetches if not cached (~3-5s first time)
+   - Subsequent access instant (<10ms, cached)
+2. **Or use tools** for explicit control
+   - `get_package_docs()` for summary/full modes
+   - `get_package_file()` for individual files
+3. **Resources auto-fetch from GitHub** on first access
+4. **Cached for efficiency** - fetch once, access forever
+5. **Works like WebDAV MCP** - standard pattern for remote data
 
 **Note:** If your client supports resources, they will be used automatically for better performance. Otherwise, the equivalent tools are used.
 
-### Prompts
+### Prompts (RESTORED)
 
 Available in **Claude Desktop** for guided workflows. Prompts provide template-based interactions:
 
 1. **`latex-to-typst-conversion`**: Guided workflow for converting LaTeX code to Typst with validation
+   - Converts LaTeX to Typst using Pandoc
+   - Validates generated Typst syntax
+   - Provides error messages and suggestions
+
 2. **`create-typst-document`**: Help create a new Typst document from scratch with proper structure
+   - Guides through document type selection
+   - Sets up proper structure and boilerplate
+   - Includes best practices
+
 3. **`fix-typst-syntax`**: Troubleshoot and fix Typst syntax errors with error analysis
+   - Analyzes error messages
+   - Suggests fixes
+   - Validates corrected code
+
 4. **`generate-typst-figure`**: Create figures, diagrams, or mathematical expressions in Typst
+   - Can convert from LaTeX or create from description
+   - Generates valid Typst code
+   - Renders preview
+
 5. **`typst-best-practices`**: Learn Typst best practices and common patterns for specific topics
+   - Provides guidance on layout, styling, math, etc.
+   - Shows idiomatic Typst code examples
+   - Includes documentation references
 
 ## Installation
 
@@ -67,6 +160,16 @@ Before installing the MCP server, ensure you have the following tools installed:
 - **Rust and Cargo** (for building Typst documentation): [Install Rust](https://rustup.rs/)
 - **Typst CLI** (for syntax validation and image generation): [Install Typst](https://github.com/typst/typst)
 - **Pandoc** (for LaTeX to Typst conversion): [Install Pandoc](https://pandoc.org/installing.html)
+
+**Optional: Configure cache directory**
+```bash
+# Set custom cache location (optional)
+export TYPST_MCP_CACHE_DIR="/path/to/custom/cache"
+# Default locations:
+# macOS: ~/Library/Caches/typst-mcp
+# Linux: ~/.cache/typst-mcp
+# Windows: %LOCALAPPDATA%\typst-mcp
+```
 
 **Quick install (macOS):**
 ```bash
