@@ -1,4 +1,5 @@
-from mcp.server.fastmcp import FastMCP, Image
+from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 from mcp.types import EmbeddedResource, BlobResourceContents, AnyUrl
 import base64
 import json
