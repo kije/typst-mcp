@@ -38,21 +38,29 @@ All tools work in every MCP client:
    - Before sending complex Typst illustrations to the user, the LLM should render the code to an image and check if it looks correct.
    - Only relevant for multi modal models.
 
-6. **`search_packages(query, max_results=20)`**: Search for packages in Typst Universe.
+6. **`typst_snippet_to_pdf(typst_snippet, output_mode="embedded")`**: Renders Typst code to a PDF document.
+   - Generates complete PDF documents from Typst code
+   - Handles multi-page documents naturally (PDF format supports multiple pages)
+   - **Two output modes:**
+     - `"embedded"` (default): Returns PDF as MCP EmbeddedResource with base64-encoded binary data (~33% size overhead)
+     - `"path"`: Saves PDF to `/tmp/typst-mcp-pdf/` and returns absolute file path (no size overhead, OS handles cleanup)
+   - Useful for creating documents, reports, presentations, etc.
+
+7. **`search_packages(query, max_results=20)`**: Search for packages in Typst Universe.
    - Search through available Typst packages by name
    - Returns package info including names, URLs, and import statements
    - Useful for discovering packages before fetching their documentation
 
-7. **`list_packages()`**: List all available packages in Typst Universe.
+8. **`list_packages()`**: List all available packages in Typst Universe.
    - Returns a complete list of all packages (900+ packages)
    - Use `search_packages()` for filtered results
 
-8. **`get_package_versions(package_name)`**: Get available versions for a package.
+9. **`get_package_versions(package_name)`**: Get available versions for a package.
    - Fetches all published versions of a package
    - Versions returned in descending order (latest first)
    - Example: `get_package_versions("cetz")` → `["0.4.2", "0.4.1", "0.4.0", ...]`
 
-9. **`get_package_docs(package_name, version=None, summary=False)`**: Fetch comprehensive documentation for a Typst Universe package.
+10. **`get_package_docs(package_name, version=None, summary=False)`**: Fetch comprehensive documentation for a Typst Universe package.
    - **Summary mode** (`summary=True`): Lightweight discovery mode (~88% smaller)
      - Package metadata with homepage, repository, keywords
      - README preview (first 500 chars)
@@ -67,7 +75,7 @@ All tools work in every MCP client:
    - Results are cached locally for fast subsequent access
    - Example: `get_package_docs("polylux", summary=True)` → 1.8 KB vs 15.5 KB full
 
-10. **`get_package_file(package_name, version, file_path)`**: Fetch a specific file from a package.
+11. **`get_package_file(package_name, version, file_path)`**: Fetch a specific file from a package.
     - Granular access to individual files without fetching all documentation
     - Use after `get_package_docs(summary=True)` to discover available files
     - Perfect for targeted retrieval (e.g., fetch one example)
