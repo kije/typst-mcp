@@ -177,7 +177,9 @@ def list_child_routes(chapter: dict) -> list[dict]:
     return child_routes
 
 
-def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> EmbeddedResource:
+def create_pdf_resource(
+    pdf_bytes: bytes, name: str = "document.pdf"
+) -> EmbeddedResource:
     """
     Creates an MCP EmbeddedResource containing a PDF file.
 
@@ -193,8 +195,8 @@ def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> Embedde
         resource=BlobResourceContents(
             uri=AnyUrl(f"file:///{name}"),
             mimeType="application/pdf",
-            blob=base64.b64encode(pdf_bytes).decode('ascii')
-        )
+            blob=base64.b64encode(pdf_bytes).decode("ascii"),
+        ),
     )
 
 
@@ -382,6 +384,7 @@ def latex_snippet_to_typst(latex_snippet) -> str:
         result = subprocess.run(
             [
                 "pandoc",
+                "--sandbox",  # SECURITY: Prevent arbitrary file operations (CVE mitigation)
                 os.path.join(temp_dir, "main.tex"),
                 "--from=latex",
                 "--to=typst",
@@ -392,6 +395,7 @@ def latex_snippet_to_typst(latex_snippet) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=30,  # SECURITY: Prevent DoS from long-running conversions
         )
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
@@ -470,6 +474,7 @@ def check_if_snippet_is_valid_typst_syntax(typst_snippet) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=30,  # SECURITY: Prevent DoS from malicious code
         )
         return "VALID"
     except subprocess.CalledProcessError as e:
@@ -559,6 +564,7 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=60,  # SECURITY: Prevent DoS (longer for image generation)
         )
 
         # Find all generated pages
@@ -648,8 +654,9 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
 @mcp.tool()
 def typst_snippet_to_pdf(
     typst_snippet: str,
-    output_mode: Literal["embedded", "path"] = "embedded"
-) -> EmbeddedResource | str:
+    output_mode: Literal["embedded", "path"] = "embedded",
+    output_path: Optional[str] = None,
+) -> Image | str:
     r"""
     Converts Typst code to a PDF document using the typst command line tool.
     Handles multi-page documents naturally (PDF format supports multiple pages).
@@ -660,20 +667,21 @@ def typst_snippet_to_pdf(
     Args:
         typst_snippet: Typst code to compile to PDF
         output_mode: How to return the PDF:
-            - "embedded" (default): Returns EmbeddedResource with base64-encoded PDF
-            - "path": Saves PDF to cache directory and returns absolute file path
+            - "embedded" (default): Returns Image object with PDF data
+            - "path": Saves PDF to disk and returns absolute file path
+        output_path: Optional custom filepath for saving PDF (only used with output_mode="path").
+                     If not provided, generates automatic filename in temp directory.
+                     Parent directory must exist.
 
     Returns:
-        - If output_mode="embedded": EmbeddedResource containing base64-encoded PDF
-        - If output_mode="path": String with absolute path to saved PDF file
+        - If output_mode="embedded": Image object containing PDF binary data
+        - If output_mode="path": Absolute path to saved PDF file (string)
         - If error: String starting with "ERROR:" describing the failure
 
     Output modes:
-        - "embedded": Best for small-medium PDFs, works with all MCP clients,
-                      data embedded in response (~33% size overhead from base64)
+        - "embedded": Best for small-medium PDFs, returns Image object with PDF data
         - "path": Best for large PDFs or file-based workflows, returns file path,
-                  no size overhead, files saved to system temp directory (/tmp),
-                  OS handles cleanup automatically
+                  no size overhead, files saved to temp directory (or custom path)
 
     Example 1 - Simple document (embedded):
     ```typst
@@ -684,15 +692,19 @@ def typst_snippet_to_pdf(
     This is a sample PDF document.
     ```
 
-    Example 2 - Multi-page document (path mode):
+    Example 2 - Path mode with auto-generated filename:
     ```python
-    # Request with path output
     typst_snippet_to_pdf(typst_code, output_mode="path")
     # Returns: "/tmp/typst-mcp-pdf/document_20250120_143022_abc123.pdf"
-    # Note: Files are temporary and cleaned up by OS
     ```
 
-    Example 3 - Large document (use path mode):
+    Example 3 - Path mode with custom filepath:
+    ```python
+    typst_snippet_to_pdf(typst_code, output_mode="path", output_path="/home/user/my_doc.pdf")
+    # Returns: "/home/user/my_doc.pdf"
+    ```
+
+    Example 4 - Large document (use path mode):
     ```typst
     #set page(paper: "us-letter")
 
@@ -723,6 +735,7 @@ def typst_snippet_to_pdf(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=60,  # SECURITY: Prevent DoS (longer for PDF generation)
             )
 
             # Read PDF bytes
@@ -731,24 +744,33 @@ def typst_snippet_to_pdf(
 
             # Return based on output mode
             if output_mode == "path":
-                # Save to persistent output directory
-                output_dir = get_pdf_output_dir()
+                # Determine output path
+                if output_path:
+                    # Use custom filepath (parent must exist)
+                    final_path = Path(output_path).absolute()
 
-                # Generate unique filename with timestamp
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
-                output_path = output_dir / unique_name
+                    # Validate parent directory exists
+                    if not final_path.parent.exists():
+                        return f"ERROR: Parent directory does not exist: {final_path.parent}"
+
+                else:
+                    # Generate automatic filename in temp directory
+                    output_dir = get_pdf_output_dir()
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
+                    final_path = output_dir / unique_name
 
                 # Write PDF to output location
-                with open(output_path, "wb") as f:
+                with open(final_path, "wb") as f:
                     f.write(pdf_bytes)
 
-                # Return absolute path
-                return str(output_path.absolute())
+                # Return absolute path as string
+                return str(final_path)
 
             else:  # embedded mode (default)
-                # Return as MCP EmbeddedResource with base64 encoding
-                return create_pdf_resource(pdf_bytes)
+                # Return as Image object with PDF data
+                # Similar to typst_snippet_to_image, but with format="pdf"
+                return Image(data=pdf_bytes, format="pdf")
 
         except subprocess.CalledProcessError as e:
             error_message = e.stderr.strip() if e.stderr else "Unknown error"
