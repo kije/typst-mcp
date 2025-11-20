@@ -1,27 +1,46 @@
-from fastmcp import FastMCP
-from fastmcp.utilities.types import Image
-from mcp.types import EmbeddedResource, BlobResourceContents, AnyUrl
+from contextlib import asynccontextmanager
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Literal
 import base64
 import json
-import subprocess
 import os
-import tempfile
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
-from pathlib import Path
-from PIL import Image as PILImage
-import io
+
+import anyio
 import numpy as np
-from typing import Optional, Literal
-from datetime import datetime
+from PIL import Image as PILImage
 
-# Import sandbox module
+from fastmcp import FastMCP, Context
+from fastmcp.exceptions import ToolError, ResourceError
+from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.types import Image, File
+
+# Import local modules
 from . import sandbox
+from .settings import typst_settings
+from .models import (
+    ChapterInfo,
+    ChapterResponse,
+    PackageDocsSummary,
+    PackageSearchResult,
+    ValidationResult,
+    ConversionResult,
+)
 
-temp_dir = tempfile.mkdtemp()
+# Use configured temp directory
+temp_dir = str(typst_settings.temp_dir)
 
+# Create logger instance
+logger = get_logger("typst-mcp")
+
+# Create FastMCP server instance
 mcp = FastMCP("Typst MCP Server")
 
 # Global state for lazy-loaded docs
@@ -30,13 +49,39 @@ _docs_state = {
     "building": False,
     "error": None,
     "docs": None,
-    "lock": threading.Lock(),
+    "lock": anyio.Lock(),
 }
 
 
 def eprint(*args, **kwargs):
-    """Print to stderr to avoid breaking MCP JSON-RPC communication."""
-    print(*args, file=sys.stderr, **kwargs)
+    """
+    DEPRECATED: Use logger instead.
+    Legacy function for backward compatibility with non-modernized code.
+
+    For new code, use:
+    - logger.debug() for debug messages
+    - logger.info() for informational messages
+    - logger.warning() for warnings
+    - logger.error() for errors
+
+    Or use Context logging inside tools:
+    - await ctx.debug()
+    - await ctx.info()
+    - await ctx.warning()
+    - await ctx.error()
+    """
+    # Convert to logger for proper FastMCP integration
+    message = " ".join(str(arg) for arg in args)
+
+    # Determine log level based on content
+    if "ERROR" in message or "Error" in message or "failed" in message.lower():
+        logger.error(message)
+    elif "WARNING" in message or "Warning" in message:
+        logger.warning(message)
+    elif "✓" in message or "success" in message.lower():
+        logger.info(message)
+    else:
+        logger.debug(message)
 
 
 def check_dependencies():
@@ -64,94 +109,125 @@ def check_dependencies():
         eprint("=" * 60 + "\n")
 
 
-def build_docs_background():
-    """Build documentation in background thread."""
-    from .build_docs import build_typst_docs, get_cache_dir
+async def build_docs_background(ctx: Context | None = None):
+    """Build documentation in background with optional progress reporting."""
+    from .build_docs import build_typst_docs
     from . import package_docs  # Import package_docs module to initialize it
 
-    with _docs_state["lock"]:
+    async with _docs_state["lock"]:
         if _docs_state["loaded"] or _docs_state["building"]:
             return
         _docs_state["building"] = True
 
     try:
-        cache_dir = get_cache_dir()
+        cache_dir = typst_settings.get_cache_dir()
         docs_dir = cache_dir / "typst-docs"
         docs_json = docs_dir / "main.json"
 
         # Check if docs already exist
         if docs_json.exists():
-            eprint("✓ Loading existing Typst documentation...")
-            with open(docs_json, "r", encoding="utf-8") as f:
-                docs_data = json.loads(f.read())
+            if ctx:
+                await ctx.debug("Loading existing Typst documentation...")
+            logger.info("✓ Loading existing Typst documentation...")
 
-            with _docs_state["lock"]:
+            # Async file read
+            async with await anyio.open_file(docs_json, "r", encoding="utf-8") as f:
+                content = await f.read()
+                docs_data = json.loads(content)
+
+            async with _docs_state["lock"]:
                 _docs_state["docs"] = docs_data
                 _docs_state["loaded"] = True
                 _docs_state["building"] = False
-            eprint("✓ Documentation loaded successfully")
+
+            if ctx:
+                await ctx.info("Documentation loaded successfully")
+            logger.info("✓ Documentation loaded successfully")
             return
 
         # Build docs if they don't exist
-        eprint("\n" + "=" * 60)
-        eprint("Typst documentation not found - building in background...")
-        eprint("=" * 60)
-        eprint("(This is a one-time process that may take 1-2 minutes)")
-        eprint("Note: Non-doc tools are available immediately!\n")
+        if ctx:
+            await ctx.info("Building Typst documentation (first run, 1-2 minutes)...")
+            if typst_settings.enable_progress_reporting:
+                await ctx.report_progress(0, 100, "Starting documentation build")
 
-        success = build_typst_docs()
+        logger.info("=" * 60)
+        logger.info("Typst documentation not found - building in background...")
+        logger.info("=" * 60)
+        logger.info("(This is a one-time process that may take 1-2 minutes)")
+        logger.info("Note: Non-doc tools are available immediately!")
+
+        # Run build in thread pool (build_typst_docs is synchronous)
+        success = await anyio.to_thread.run_sync(build_typst_docs)
 
         if not success:
-            with _docs_state["lock"]:
+            async with _docs_state["lock"]:
                 _docs_state["error"] = "Failed to build documentation"
                 _docs_state["building"] = False
-            eprint("\n" + "=" * 60)
-            eprint("ERROR: Failed to build documentation automatically.")
-            eprint("Documentation-related tools will not be available.")
-            eprint("=" * 60 + "\n")
+
+            error_msg = "Failed to build documentation automatically"
+            if ctx:
+                await ctx.error(error_msg)
+            logger.error("=" * 60)
+            logger.error(f"ERROR: {error_msg}")
+            logger.error("Documentation-related tools will not be available.")
+            logger.error("=" * 60)
             return
 
         # Load the built docs
-        with open(docs_json, "r", encoding="utf-8") as f:
-            docs_data = json.loads(f.read())
+        async with await anyio.open_file(docs_json, "r", encoding="utf-8") as f:
+            content = await f.read()
+            docs_data = json.loads(content)
 
-        with _docs_state["lock"]:
+        async with _docs_state["lock"]:
             _docs_state["docs"] = docs_data
             _docs_state["loaded"] = True
             _docs_state["building"] = False
 
-        eprint("\n" + "=" * 60)
-        eprint("Documentation built and loaded successfully!")
-        eprint("All tools are now available.")
-        eprint("=" * 60 + "\n")
+        if ctx:
+            await ctx.info("Documentation built and loaded successfully!")
+            if typst_settings.enable_progress_reporting:
+                await ctx.report_progress(100, 100, "Complete")
+
+        logger.info("=" * 60)
+        logger.info("Documentation built and loaded successfully!")
+        logger.info("All tools are now available.")
+        logger.info("=" * 60)
 
     except Exception as e:
-        with _docs_state["lock"]:
+        async with _docs_state["lock"]:
             _docs_state["error"] = str(e)
             _docs_state["building"] = False
-        eprint(f"\n ERROR building docs: {e}\n")
+
+        error_msg = f"Error building docs: {e}"
+        if ctx:
+            await ctx.error(error_msg)
+        logger.error(error_msg)
 
 
-def get_docs(wait_seconds=5):
+async def get_docs(wait_seconds: int | None = None) -> dict:
     """
     Get the typst docs, waiting if they're being built.
     Returns docs or raises error if not available.
     """
+    if wait_seconds is None:
+        wait_seconds = typst_settings.docs_wait_timeout
+
     # If already loaded, return immediately
     if _docs_state["loaded"]:
         return _docs_state["docs"]
 
     # If building, wait briefly
     if _docs_state["building"]:
-        eprint(f"Waiting for documentation to finish building (max {wait_seconds}s)...")
+        logger.info(f"Waiting for documentation to finish building (max {wait_seconds}s)...")
         start = time.time()
         while time.time() - start < wait_seconds:
-            time.sleep(0.5)
+            await anyio.sleep(0.5)
             if _docs_state["loaded"]:
                 return _docs_state["docs"]
 
         # Still building after wait
-        raise RuntimeError(
+        raise ResourceError(
             "Documentation is still building. This typically takes 1-2 minutes on first run. "
             "Please try again in a moment. Non-documentation tools (LaTeX conversion, "
             "syntax validation, image rendering) are available immediately."
@@ -159,10 +235,10 @@ def get_docs(wait_seconds=5):
 
     # Not loaded and not building - check for error
     if _docs_state["error"]:
-        raise RuntimeError(f"Documentation failed to build: {_docs_state['error']}")
+        raise ResourceError(f"Documentation failed to build: {_docs_state['error']}")
 
     # Should not reach here, but handle gracefully
-    raise RuntimeError("Documentation not available. Please restart the server.")
+    raise ResourceError("Documentation not available. Please restart the server.")
 
 
 def list_child_routes(chapter: dict) -> list[dict]:
@@ -181,35 +257,7 @@ def list_child_routes(chapter: dict) -> list[dict]:
     return child_routes
 
 
-def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> list:
-    """
-    Creates an MCP EmbeddedResource containing a PDF file.
-
-    Args:
-        pdf_bytes: Raw PDF binary data
-        name: Filename for the PDF resource (default: document.pdf)
-
-    Returns:
-        EmbeddedResource with BlobResourceContents containing base64-encoded PDF
-    """
-    # return EmbeddedResource(
-    #     type="resource",
-    #     resource=BlobResourceContents(
-    #         uri=AnyUrl(f"file:///{name}"),
-    #         mimeType="application/pdf",
-    #         blob=base64.b64encode(pdf_bytes).decode("ascii"),
-    #     ),
-    # )
-    return [
-        {
-            "type": "resource",
-            "resource": {
-                "uri": "data:application/pdf;base64",
-                "mimeType": "application/pdf",
-                "blob": base64.b64encode(pdf_bytes).decode("ascii"),
-            },
-        }
-    ]
+# Removed create_pdf_resource - now using File type from fastmcp.utilities.types
 
 
 def cleanup_old_pdfs(directory: Path, max_age_hours: int = 24):
@@ -262,16 +310,27 @@ def get_pdf_output_dir() -> Path:
 
 
 @mcp.tool()
-def list_docs_chapters() -> str:
+async def list_docs_chapters(ctx: Context) -> str:
+    """Lists all chapters in the Typst documentation.
+
+    The LLM should use this to get an overview of available documentation chapters,
+    then decide which specific chapter to read.
+
+    Args:
+        ctx: MCP context for logging and progress reporting
+
+    Returns:
+        JSON string containing list of chapters with routes and sizes
+
+    Raises:
+        ResourceError: If documentation is not available
     """
-    Lists all chapters in the typst docs.
-    The LLM should use this in the beginning to get the list of chapters and then decide which chapter to read.
-    """
-    eprint("mcp.tool('list_docs_chapters') called")
+    await ctx.debug("Listing documentation chapters")
 
     try:
-        typst_docs = get_docs(wait_seconds=10)
-    except RuntimeError as e:
+        typst_docs = await get_docs(wait_seconds=10)
+    except ResourceError as e:
+        await ctx.error(f"Documentation not available: {e}")
         return json.dumps({"error": str(e)})
 
     chapters = []
@@ -280,6 +339,8 @@ def list_docs_chapters() -> str:
             {"route": chapter["route"], "content_length": len(json.dumps(chapter))}
         )
         chapters += list_child_routes(chapter)
+
+    await ctx.info(f"Found {len(chapters)} documentation chapters")
     return json.dumps(chapters)
 
 
@@ -381,77 +442,90 @@ def get_docs_chapters(routes: list) -> str:
 
 
 @mcp.tool()
-def latex_snippet_to_typst(latex_snippet) -> str:
-    r"""
-    Converts a latex to typst using pandoc.
+async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
+    r"""Converts LaTeX to Typst using Pandoc.
 
-    LLMs are way better at writing latex than typst.
-    So the LLM should write the wanted output in latex and use this tool to convert it to typst.
+    LLMs are often better at writing LaTeX than Typst, so this tool enables
+    writing in LaTeX and converting to Typst automatically.
 
-    If it was not valid latex, the tool returns "ERROR: in latex_to_typst. Failed to convert latex to typst. Error message from pandoc: {error_message}".
+    Args:
+        latex_snippet: LaTeX code to convert
+        ctx: MCP context for logging and progress reporting
 
-    This should be used primarily for converting small snippets of latex to typst but it can also be used for larger snippets.
+    Returns:
+        Converted Typst code (stripped of leading/trailing whitespace)
 
-    Example 1:
-    ```latex
-    "$ f\in K ( t^ { H } , \beta ) _ { \delta } $"
-    ```
-    gets converted to:
-    ```typst
-    $f in K \( t^H \, beta \)_delta$
-    ```
+    Raises:
+        ToolError: If conversion fails due to invalid LaTeX or Pandoc error
 
-    Example 2:
-    ```latex
-    \begin{figure}[t]
-        \includegraphics[width=8cm]{"placeholder.png"}
-        \caption{Placeholder image}
-        \label{fig:placeholder}
-        \centering
-    \end{figure}
-    ```
-    gets converted to:
-    ```typst
-    #figure(image("placeholder.png", width: 8cm),
-        caption: [
-            Placeholder image
-        ]
-    )
-    <fig:placeholder>
-    ```
+    Examples:
+        Math expression:
+        ```latex
+        $ f\in K ( t^ { H } , \beta ) _ { \delta } $
+        ```
+        Converts to:
+        ```typst
+        $f in K \( t^H \, beta \)_delta$
+        ```
+
+        Figure:
+        ```latex
+        \begin{figure}[t]
+            \includegraphics[width=8cm]{"placeholder.png"}
+            \caption{Placeholder image}
+            \label{fig:placeholder}
+        \end{figure}
+        ```
+        Converts to:
+        ```typst
+        #figure(image("placeholder.png", width: 8cm),
+            caption: [Placeholder image]
+        )
+        <fig:placeholder>
+        ```
     """
-    # create a main.tex file with the latex_snippet
-    with open(os.path.join(temp_dir, "main.tex"), "w") as f:
-        f.write(latex_snippet)
+    await ctx.debug(f"Converting LaTeX snippet ({len(latex_snippet)} chars)")
 
-    # run the pandoc command line tool and capture error output
+    # Write LaTeX to temp file (async)
+    tex_file = Path(temp_dir) / "main.tex"
+    typ_file = Path(temp_dir) / "main.typ"
+
+    await anyio.Path(tex_file).write_text(latex_snippet, encoding="utf-8")
+
+    # Run Pandoc conversion in thread pool (sandboxed)
     try:
-        result = sandbox.run_sandboxed(
-            [
-                "pandoc",
-                "--sandbox",  # SECURITY: Prevent arbitrary file operations (CVE mitigation)
-                os.path.join(temp_dir, "main.tex"),
-                "--from=latex",
-                "--to=typst",
-                "--output",
-                os.path.join(temp_dir, "main.typ"),
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,  # SECURITY: Prevent DoS from long-running conversions
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                [
+                    "pandoc",
+                    "--sandbox",  # SECURITY: Prevent arbitrary file operations
+                    str(tex_file),
+                    "--from=latex",
+                    "--to=typst",
+                    "--output",
+                    str(typ_file),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=typst_settings.pandoc_timeout,
+            )
         )
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
-        return f"ERROR: in latex_to_typst. Failed to convert latex to typst. Error message from pandoc: {error_message}"
+        await ctx.error(f"Pandoc conversion failed: {error_message}")
+        raise ToolError(
+            f"Failed to convert LaTeX to Typst. Pandoc error: {error_message}",
+            details={"snippet_length": len(latex_snippet)},
+        ) from e
 
-    # read the typst file
-    with open(os.path.join(temp_dir, "main.typ"), "r") as f:
-        typst = f.read()
-        typst = typst.strip()
+    # Read converted Typst code (async)
+    typst_code = await anyio.Path(typ_file).read_text(encoding="utf-8")
+    typst_code = typst_code.strip()
 
-    return typst
+    await ctx.info(f"Successfully converted to Typst ({len(typst_code)} chars)")
+    return typst_code
 
 
 @mcp.tool()
@@ -698,11 +772,12 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
 
 # NOTE: This tool is registered manually in main() with dynamic description
 # Do not add @mcp.tool() decorator here - it needs runtime sandbox info
-def typst_snippet_to_pdf(
+async def typst_snippet_to_pdf(
     typst_snippet: str,
+    ctx: Context,
     output_mode: Literal["embedded", "path"] = "embedded",
-    output_path: Optional[str] = None,
-) -> list | str:
+    output_path: str | None = None,
+) -> File | str:
     r"""
     Converts Typst code to a PDF document using the typst command line tool.
     Handles multi-page documents naturally (PDF format supports multiple pages).
@@ -726,15 +801,18 @@ def typst_snippet_to_pdf(
                      If you need to write outside these directories, use output_mode="embedded" instead.
 
     Returns:
-        - If output_mode="embedded": Image object containing PDF binary data
+        - If output_mode="embedded": File object containing PDF binary data
         - If output_mode="path": Absolute path to saved PDF file (string)
-        - If error: String starting with "ERROR:" describing the failure
+
+    Raises:
+        ToolError: If PDF compilation fails
 
     Output modes:
-        - "embedded": Best for small-medium PDFs, returns embedded resource object with PDF data
-                      No filesystem restrictions - PDF data returned directly
-        - "path": Best for large PDFs or file-based workflows, returns file path
-                  Subject to filesystem security restrictions (see output_path docs)
+        - "embedded": Best for small-medium PDFs, returns File object with PDF data.
+                      FastMCP automatically converts to EmbeddedResource with base64 encoding.
+                      No filesystem restrictions - PDF data returned directly.
+        - "path": Best for large PDFs or file-based workflows, returns file path string.
+                  Subject to filesystem security restrictions (see output_path docs).
 
     Example 1 - Simple document (embedded mode - recommended):
     ```typst
@@ -781,30 +859,35 @@ def typst_snippet_to_pdf(
 
     {{SANDBOX_PATHS_PLACEHOLDER}}
     """
+    await ctx.debug(f"Compiling Typst to PDF (mode: {output_mode}, {len(typst_snippet)} chars)")
 
-    # Create unique temporary directory for this request (thread-safe)
-    with tempfile.TemporaryDirectory() as request_temp_dir:
-        typ_file = os.path.join(request_temp_dir, "main.typ")
-        pdf_file = os.path.join(request_temp_dir, "output.pdf")
-
-        # Write snippet to temp file with explicit UTF-8 encoding
-        with open(typ_file, "w", encoding="utf-8") as f:
-            f.write(typst_snippet)
+    # Create unique temporary directory
+    async with anyio.create_task_group() as tg:
+        # Create temp files
+        typ_file = Path(temp_dir) / f"main_{id(tg)}.typ"
+        pdf_file = Path(temp_dir) / f"output_{id(tg)}.pdf"
 
         try:
-            # Compile to PDF
-            sandbox.run_sandboxed(
-                ["typst", "compile", typ_file, pdf_file],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60,  # SECURITY: Prevent DoS (longer for PDF generation)
+            # Write snippet (async)
+            await anyio.Path(typ_file).write_text(typst_snippet, encoding="utf-8")
+
+            # Compile to PDF (run in thread pool)
+            # Note: anyio.to_thread.run_sync doesn't accept kwargs, so we use a lambda
+            await anyio.to_thread.run_sync(
+                lambda: sandbox.run_sandboxed(
+                    ["typst", "compile", str(typ_file), str(pdf_file)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=typst_settings.typst_compile_timeout,
+                )
             )
 
-            # Read PDF bytes
-            with open(pdf_file, "rb") as f:
-                pdf_bytes = f.read()
+            # Read PDF bytes (async)
+            pdf_bytes = await anyio.Path(pdf_file).read_bytes()
+
+            await ctx.debug(f"Generated PDF ({len(pdf_bytes)} bytes)")
 
             # Return based on output mode
             if output_mode == "path":
@@ -818,12 +901,19 @@ def typst_snippet_to_pdf(
                     # Avoids vulnerabilities: symlinks, path traversal, race conditions, etc.
 
                     try:
-                        # Use secure_copy_file (cross-platform, sandbox-enforced)
-                        sandbox.secure_copy_file(pdf_file, str(final_path), timeout=10)
+                        # Use secure_copy_file (cross-platform, sandbox-enforced, async)
+                        await anyio.to_thread.run_sync(
+                            partial(
+                                sandbox.secure_copy_file,
+                                str(pdf_file),
+                                str(final_path),
+                                timeout=10,
+                            )
+                        )
 
                         # SECURITY: Restrict file permissions to owner-only (0600)
                         try:
-                            os.chmod(final_path, 0o600)
+                            await anyio.to_thread.run_sync(os.chmod, final_path, 0o600)
                         except Exception as chmod_err:
                             eprint(f"Warning: Could not restrict PDF permissions: {chmod_err}")
 
@@ -835,12 +925,11 @@ def typst_snippet_to_pdf(
                             error_msg = str(e)
 
                         # Get allowed directories for helpful error message
-                        from . import sandbox as sandbox_module
-                        sb = sandbox_module.get_sandbox()
+                        sb = sandbox.get_sandbox()
                         allowed_dirs = sb.config.allow_write if sb and sb.config else []
 
-                        return (
-                            f"ERROR: Could not write PDF to requested location.\n"
+                        error_details = (
+                            f"Could not write PDF to requested location.\n"
                             f"Requested: {final_path}\n"
                             f"Error: {error_msg}\n\n"
                             f"Allowed write directories (enforced by OS sandbox):\n" +
@@ -852,6 +941,9 @@ def typst_snippet_to_pdf(
                             "  4. Use output_mode='embedded' to get PDF data directly (no restrictions)"
                         )
 
+                        await ctx.error(f"PDF write failed: {error_msg}")
+                        raise ToolError(error_details) from e
+
                 else:
                     # Generate automatic filename in temp directory (always allowed)
                     output_dir = get_pdf_output_dir()
@@ -859,23 +951,47 @@ def typst_snippet_to_pdf(
                     unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
                     final_path = output_dir / unique_name
 
-                    # Copy using sandboxed copy (even though temp dir is always allowed)
+                    # Copy using sandboxed copy (async)
                     try:
-                        sandbox.secure_copy_file(pdf_file, str(final_path), timeout=10)
+                        await anyio.to_thread.run_sync(
+                            partial(
+                                sandbox.secure_copy_file,
+                                str(pdf_file),
+                                str(final_path),
+                                timeout=10,
+                            )
+                        )
                     except Exception as e:
-                        return f"ERROR: Failed to copy PDF to temp directory: {e}"
+                        await ctx.error(f"Failed to copy PDF: {e}")
+                        raise ToolError(f"Failed to copy PDF to temp directory: {e}") from e
 
-                # Return absolute path as string
+                await ctx.info(f"PDF saved to: {final_path}")
                 return str(final_path)
 
             else:  # embedded mode (default)
-                # Return as Image object with PDF data
-                # Similar to typst_snippet_to_image, but with format="pdf"
-                return create_pdf_resource(pdf_bytes)
+                # Return File object - FastMCP automatically converts to EmbeddedResource
+                await ctx.info(f"Returning embedded PDF ({len(pdf_bytes)} bytes)")
+                return File(
+                    data=pdf_bytes,
+                    format="pdf",
+                    name="document.pdf",
+                )
 
         except subprocess.CalledProcessError as e:
             error_message = e.stderr.strip() if e.stderr else "Unknown error"
-            return f"ERROR: in typst_snippet_to_pdf. Failed to compile Typst to PDF. Error: {error_message}"
+            await ctx.error(f"Typst compilation failed: {error_message}")
+            raise ToolError(
+                f"Failed to compile Typst to PDF: {error_message}",
+                details={"snippet_length": len(typst_snippet)},
+            ) from e
+        finally:
+            # Cleanup temp files (async)
+            for temp_file in [typ_file, pdf_file]:
+                try:
+                    if await anyio.Path(temp_file).exists():
+                        await anyio.Path(temp_file).unlink()
+                except Exception:
+                    pass  # Ignore cleanup errors
 
 
 # ============================================================================
@@ -1441,7 +1557,7 @@ def get_package_versions(package_name: str) -> str:
 
 @mcp.tool()
 def get_package_docs(
-    package_name: str, version: Optional[str] = None, summary: bool = False
+    package_name: str, version: str | None = None, summary: bool = False
 ) -> str:
     """
     Fetch documentation for a Typst Universe package.
@@ -1865,7 +1981,7 @@ def _get_pdf_tool_description():
     )
 
     if sb and sb.sandboxed:
-        eprint(f"✓ Generated PDF tool description with {len(allowed_dirs)} sandbox paths")
+        logger.debug(f"✓ Generated PDF tool description with {len(allowed_dirs)} sandbox paths")
 
     return full_description
 
@@ -1878,7 +1994,7 @@ def main():
     check_dependencies()
 
     # Initialize sandboxing
-    eprint("Initializing security sandbox...")
+    logger.info("Initializing security sandbox...")
     sandbox.initialize_sandbox(temp_dir)
 
     # Manually register typst_snippet_to_pdf with dynamic description
@@ -1891,9 +2007,9 @@ def main():
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                eprint(f"✓ Cleaned up temporary directory: {temp_dir}")
+                logger.info(f"✓ Cleaned up temporary directory: {temp_dir}")
         except Exception as e:
-            eprint(f"Warning: Failed to clean up temp directory: {e}")
+            logger.warning(f"Failed to clean up temp directory: {e}")
 
     atexit.register(cleanup_temp_dir)
 
@@ -1904,28 +2020,36 @@ def main():
             pdf_dir = Path(tempfile.gettempdir()) / "typst-mcp-pdf"
             cleanup_old_pdfs(pdf_dir, max_age_hours=0)  # Delete all on shutdown
         except Exception as e:
-            eprint(f"Warning: Failed to clean up PDFs on exit: {e}")
+            logger.warning(f"Failed to clean up PDFs on exit: {e}")
 
     atexit.register(cleanup_all_pdfs)
 
     # Start background thread to build/load docs
-    eprint("\nStarting Typst MCP Server...")
-    eprint("\nTools available immediately:")
-    eprint("  - LaTeX conversion: latex_snippet_to_typst, latex_snippets_to_typst")
-    eprint(
+    logger.info("Starting Typst MCP Server...")
+    logger.info("")
+    logger.info("Tools available immediately:")
+    logger.info("  - LaTeX conversion: latex_snippet_to_typst, latex_snippets_to_typst")
+    logger.info(
         "  - Syntax validation: check_if_snippet_is_valid_typst_syntax, check_if_snippets_are_valid_typst_syntax"
     )
-    eprint("  - Image rendering: typst_snippet_to_image")
-    eprint("  - Package search: search_packages, list_packages, get_package_versions")
-    eprint("  - Package docs: get_package_docs (fetches on-demand)")
-    eprint("\nResources available:")
-    eprint("  - typst://packages/cached - List of all cached package docs")
-    eprint("  - typst://package/{name}/{version} - Cached package documentation")
-    eprint(
-        "\nCore documentation tools will be available after docs are loaded/built...\n"
-    )
+    logger.info("  - Image rendering: typst_snippet_to_image")
+    logger.info("  - Package search: search_packages, list_packages, get_package_versions")
+    logger.info("  - Package docs: get_package_docs (fetches on-demand)")
+    logger.info("")
+    logger.info("Resources available:")
+    logger.info("  - typst://packages/cached - List of all cached package docs")
+    logger.info("  - typst://package/{name}/{version} - Cached package documentation")
+    logger.info("")
+    logger.info("Core documentation tools will be available after docs are loaded/built...")
+    logger.info("")
 
-    doc_thread = threading.Thread(target=build_docs_background, daemon=True)
+    # Wrapper to run async build_docs_background in a thread
+    def run_async_docs_build():
+        """Wrapper to run async function in thread."""
+        import asyncio
+        asyncio.run(build_docs_background(None))
+
+    doc_thread = threading.Thread(target=run_async_docs_build, daemon=True)
     doc_thread.start()
 
     # Run the server
