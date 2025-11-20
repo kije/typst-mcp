@@ -4,13 +4,34 @@
 import subprocess
 import sys
 import shutil
+import os
 from pathlib import Path
+
+
+def eprint(*args, **kwargs):
+    """Print to stderr to avoid breaking MCP JSON-RPC communication."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def get_cache_dir():
+    """Get the cache directory for typst-mcp data."""
+    # Use platform-appropriate cache directory
+    if sys.platform == "darwin":
+        cache_base = Path.home() / "Library" / "Caches"
+    elif sys.platform == "win32":
+        cache_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:  # Linux and others
+        cache_base = Path.home() / ".cache"
+
+    cache_dir = cache_base / "typst-mcp"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
 
 def check_cargo_installed():
     """Check if cargo is installed and meets minimum version requirements."""
     if shutil.which("cargo") is None:
-        print("ERROR: cargo is not installed. Please install Rust toolchain from https://rustup.rs/")
+        eprint("ERROR: cargo is not installed. Please install Rust toolchain from https://rustup.rs/")
         return False
 
     # Check Rust version
@@ -22,7 +43,7 @@ def check_cargo_installed():
             check=True
         )
         version_output = result.stdout.strip()
-        print(f"Detected {version_output}")
+        eprint(f"Detected {version_output}")
 
         # Extract version number (e.g., "rustc 1.86.0" -> "1.86.0")
         if "rustc" in version_output:
@@ -32,68 +53,164 @@ def check_cargo_installed():
 
             # Typst requires Rust 1.89+
             if version_num < 189:
-                print(f"\nERROR: Rust version {version_str} is too old.")
-                print("Typst requires Rust 1.89 or later.")
-                print("\nTo update Rust, run:")
-                print("  rustup update")
+                eprint(f"\nERROR: Rust version {version_str} is too old.")
+                eprint("Typst requires Rust 1.89 or later.")
+                eprint("\nTo update Rust, run:")
+                eprint("  rustup update")
                 return False
 
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        print(f"WARNING: Could not check Rust version: {e}")
-        print("Proceeding anyway, but build may fail if Rust is outdated.")
+        eprint(f"WARNING: Could not check Rust version: {e}")
+        eprint("Proceeding anyway, but build may fail if Rust is outdated.")
 
     return True
 
 
-def build_typst_docs():
-    """Generate Typst documentation by running cargo in the vendor/typst submodule."""
-    # Find the package root (where this script's parent directory is)
-    script_dir = Path(__file__).parent
-    root = script_dir.parent
+def get_repo_commit_hash(repo_path: Path) -> str:
+    """Get the current git commit hash of a repository."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
 
-    docs_dir = root / "typst-docs"
-    docs_json = docs_dir / "main.json"
-    typst_repo = root / "vendor" / "typst"
 
-    print(f"Root directory: {root}")
-    print(f"Docs directory: {docs_dir}")
-    print(f"Typst repo: {typst_repo}")
+def needs_rebuild(cache_dir: Path, typst_repo: Path) -> bool:
+    """Check if documentation needs to be rebuilt due to version changes."""
+    version_file = cache_dir / "typst-docs" / ".version"
+    docs_json = cache_dir / "typst-docs" / "main.json"
 
-    # Check if docs already exist and are valid
-    if docs_json.exists():
-        print("✓ Typst docs already generated at typst-docs/main.json")
-        print("  To regenerate, delete typst-docs/main.json and run this command again.")
+    # If docs don't exist, rebuild needed
+    if not docs_json.exists():
         return True
+
+    # If version file doesn't exist (old installation), rebuild
+    if not version_file.exists():
+        eprint("ℹ️  No version tracking found - will rebuild to track versions")
+        return True
+
+    # Check if typst repo exists
+    if not (typst_repo / ".git").exists():
+        return True
+
+    # Read stored version
+    try:
+        with open(version_file, 'r') as f:
+            stored_commit = f.read().strip()
+    except:
+        return True
+
+    # Get current commit from repo
+    current_commit = get_repo_commit_hash(typst_repo)
+    if not current_commit:
+        return True
+
+    # Compare versions
+    if stored_commit != current_commit:
+        eprint(f"ℹ️  New Typst version detected")
+        eprint(f"   Old: {stored_commit[:8]}")
+        eprint(f"   New: {current_commit[:8]}")
+        return True
+
+    return False
+
+
+def save_version(cache_dir: Path, typst_repo: Path):
+    """Save the current typst repo commit hash to version file."""
+    commit_hash = get_repo_commit_hash(typst_repo)
+    if commit_hash:
+        version_file = cache_dir / "typst-docs" / ".version"
+        with open(version_file, 'w') as f:
+            f.write(commit_hash)
+        eprint(f"✓ Saved version: {commit_hash[:8]}")
+
+
+def update_typst_repo(typst_repo: Path) -> bool:
+    """Update the typst repository to the latest version."""
+    if (typst_repo / ".git").exists():
+        eprint("Checking for Typst updates...")
+        try:
+            # Fetch latest changes
+            subprocess.run(
+                ["git", "fetch", "origin", "main"],
+                cwd=typst_repo,
+                capture_output=True,
+                check=True
+            )
+            # Reset to latest
+            subprocess.run(
+                ["git", "reset", "--hard", "origin/main"],
+                cwd=typst_repo,
+                capture_output=True,
+                check=True
+            )
+            eprint("✓ Typst repository updated to latest version")
+            return True
+        except subprocess.CalledProcessError as e:
+            eprint(f"Warning: Could not update typst repo: {e.stderr}")
+            return False
+    return True
+
+
+def build_typst_docs():
+    """Generate Typst documentation by running cargo in the typst repository."""
+    # Get cache directory for persistent storage across uvx runs
+    cache_dir = get_cache_dir()
+    docs_dir = cache_dir / "typst-docs"
+    docs_json = docs_dir / "main.json"
+    typst_repo = cache_dir / "typst"
+
+    eprint(f"Cache directory: {cache_dir}")
+    eprint(f"Docs directory: {docs_dir}")
+    eprint(f"Typst repo: {typst_repo}")
+
+    # Check if rebuild is needed
+    if not needs_rebuild(cache_dir, typst_repo):
+        eprint("✓ Typst docs are up to date")
+        eprint(f"  Location: {docs_json}")
+        return True
+
+    # If docs exist but version changed, we'll rebuild
+    if docs_json.exists():
+        eprint("ℹ️  Rebuilding documentation with new version...")
 
     # Check if cargo is installed
     if not check_cargo_installed():
         return False
 
-    # Ensure submodule is initialized
+    # Ensure typst repository is cloned
     if not (typst_repo / "Cargo.toml").exists():
-        print("Initializing typst submodule (this may take a moment)...")
+        eprint("Cloning typst repository (this may take a moment)...")
         try:
             subprocess.run(
-                ["git", "submodule", "update", "--init", "--depth=1", "vendor/typst"],
-                cwd=root,
+                ["git", "clone", "--depth=1", "https://github.com/typst/typst.git", str(typst_repo)],
                 check=True,
                 capture_output=True,
                 text=True
             )
-            print("✓ Typst submodule initialized")
+            eprint("✓ Typst repository cloned")
         except subprocess.CalledProcessError as e:
-            print(f"ERROR: Failed to initialize submodule: {e.stderr}")
+            eprint(f"ERROR: Failed to clone repository: {e.stderr}")
             return False
         except FileNotFoundError:
-            print("ERROR: git command not found. Please install git.")
+            eprint("ERROR: git command not found. Please install git.")
             return False
+    else:
+        # Update existing repository to latest version
+        update_typst_repo(typst_repo)
 
     # Create docs directory
-    docs_dir.mkdir(exist_ok=True)
+    docs_dir.mkdir(parents=True, exist_ok=True)
 
     # Run cargo command to generate docs
-    print("Generating Typst documentation (this may take 30-60 seconds)...")
-    print("Running: cargo run --package typst-docs ...")
+    eprint("Generating Typst documentation (this may take 30-60 seconds)...")
+    eprint("Running: cargo run --package typst-docs ...")
 
     try:
         result = subprocess.run(
@@ -109,32 +226,36 @@ def build_typst_docs():
             capture_output=True,
             text=True
         )
-        print("✓ Typst documentation generated successfully")
-        print(f"  Output: {docs_json}")
+        eprint("✓ Typst documentation generated successfully")
+        eprint(f"  Output: {docs_json}")
+
+        # Save version for future checks
+        save_version(cache_dir, typst_repo)
+
         return True
 
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to generate docs: {e.stderr}")
+        eprint(f"ERROR: Failed to generate docs: {e.stderr}")
         return False
 
 
 def main():
     """Entry point for the build script."""
-    print("=" * 60)
-    print("Typst MCP Server - Documentation Build Script")
-    print("=" * 60)
+    eprint("=" * 60)
+    eprint("Typst MCP Server - Documentation Build Script")
+    eprint("=" * 60)
 
     success = build_typst_docs()
 
     if success:
-        print("\n" + "=" * 60)
-        print("Build completed successfully!")
-        print("=" * 60)
+        eprint("\n" + "=" * 60)
+        eprint("Build completed successfully!")
+        eprint("=" * 60)
         sys.exit(0)
     else:
-        print("\n" + "=" * 60)
-        print("Build failed. Please check the errors above.")
-        print("=" * 60)
+        eprint("\n" + "=" * 60)
+        eprint("Build failed. Please check the errors above.")
+        eprint("=" * 60)
         sys.exit(1)
 
 

@@ -15,11 +15,16 @@ temp_dir = tempfile.mkdtemp()
 mcp = FastMCP("Typst MCP Server")
 
 
+def eprint(*args, **kwargs):
+    """Print to stderr to avoid breaking MCP JSON-RPC communication."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
 def check_dependencies():
     """Check if required external tools are available."""
     required = {
         "typst": "Typst CLI (https://github.com/typst/typst)",
-        "pandoc": "Pandoc (https://pandoc.org/installing.html)"
+        "pandoc": "Pandoc (https://pandoc.org/installing.html)",
     }
     missing = []
 
@@ -28,16 +33,16 @@ def check_dependencies():
             missing.append(f"  - {tool}: {info}")
 
     if missing:
-        print("\n" + "=" * 60)
-        print("WARNING: Missing required external tools:")
-        print("=" * 60)
+        eprint("\n" + "=" * 60)
+        eprint("WARNING: Missing required external tools:")
+        eprint("=" * 60)
         for msg in missing:
-            print(msg)
-        print("\nInstallation instructions:")
-        print("  macOS:   brew install typst pandoc")
-        print("  Linux:   apt install typst pandoc  # or your package manager")
-        print("  Windows: See installation links above")
-        print("=" * 60 + "\n")
+            eprint(msg)
+        eprint("\nInstallation instructions:")
+        eprint("  macOS:   brew install typst pandoc")
+        eprint("  Linux:   apt install typst pandoc  # or your package manager")
+        eprint("  Windows: See installation links above")
+        eprint("=" * 60 + "\n")
 
 
 def ensure_docs_built():
@@ -46,35 +51,34 @@ def ensure_docs_built():
     If docs don't exist, automatically build them.
     Returns the path to the docs JSON file.
     """
-    from .build_docs import build_typst_docs
+    from .build_docs import build_typst_docs, get_cache_dir
 
-    # Find package root (parent of typst_mcp/)
-    package_dir = Path(__file__).parent
-    root_dir = package_dir.parent
-    docs_dir = root_dir / "typst-docs"
+    # Use cache directory for persistent storage across uvx runs
+    cache_dir = get_cache_dir()
+    docs_dir = cache_dir / "typst-docs"
     docs_json = docs_dir / "main.json"
 
     if not docs_json.exists():
-        print("\n" + "=" * 60)
-        print("Typst documentation not found - building automatically...")
-        print("=" * 60)
-        print("(This is a one-time process that may take 1-2 minutes)\n")
+        eprint("\n" + "=" * 60)
+        eprint("Typst documentation not found - building automatically...")
+        eprint("=" * 60)
+        eprint("(This is a one-time process that may take 1-2 minutes)\n")
 
         # Build the docs
         success = build_typst_docs()
 
         if not success:
-            print("\n" + "=" * 60)
-            print("ERROR: Failed to build documentation automatically.")
-            print("=" * 60)
-            print("\nPlease try building manually:")
-            print("  uvx --from typst-mcp typst-mcp-build")
-            print("=" * 60 + "\n")
+            eprint("\n" + "=" * 60)
+            eprint("ERROR: Failed to build documentation automatically.")
+            eprint("=" * 60)
+            eprint("\nPlease try building manually:")
+            eprint("  uvx --from typst-mcp typst-mcp-build")
+            eprint("=" * 60 + "\n")
             sys.exit(1)
 
-        print("\n" + "=" * 60)
-        print("Documentation built successfully!")
-        print("=" * 60 + "\n")
+        eprint("\n" + "=" * 60)
+        eprint("Documentation built successfully!")
+        eprint("=" * 60 + "\n")
 
     return docs_json
 
@@ -98,10 +102,9 @@ def list_child_routes(chapter: dict) -> list[dict]:
     child_routes = []  # { "route": str, content_length: int }[]
     for child in chapter["children"]:
         if "route" in child:
-            child_routes.append({
-                "route": child["route"],
-                "content_length": len(json.dumps(child))
-            })
+            child_routes.append(
+                {"route": child["route"], "content_length": len(json.dumps(child))}
+            )
         child_routes += list_child_routes(child)
     return child_routes
 
@@ -112,13 +115,12 @@ def list_docs_chapters() -> str:
     Lists all chapters in the typst docs.
     The LLM should use this in the beginning to get the list of chapters and then decide which chapter to read.
     """
-    print("mcp.resource('docs://chapters') called")
+    eprint("mcp.resource('docs://chapters') called")
     chapters = []
     for chapter in typst_docs:
-        chapters.append({
-            "route": chapter["route"],
-            "content_length": len(json.dumps(chapter))
-        })
+        chapters.append(
+            {"route": chapter["route"], "content_length": len(json.dumps(chapter))}
+        )
         chapters += list_child_routes(chapter)
     return json.dumps(chapters)
 
@@ -134,7 +136,7 @@ def get_docs_chapter(route: str) -> str:
     If a chapter has children and its content length is over 1000, this will only return the child routes
     instead of the full content to avoid overwhelming responses.
     """
-    print(f"mcp.resource('docs://chapters/{route}') called")
+    eprint(f"mcp.resource('docs://chapters/{route}') called")
 
     # the rout could also be in the form of "____reference____layout____colbreak" -> "/reference/layout/colbreak"
     # replace all underscores with slashes
@@ -173,15 +175,18 @@ def get_docs_chapter(route: str) -> str:
 
     # Check if chapter has children and is large
     content_length = len(json.dumps(found_chapter))
-    if "children" in found_chapter and len(found_chapter["children"]) > 0 and content_length > 1000:
+    if (
+        "children" in found_chapter
+        and len(found_chapter["children"]) > 0
+        and content_length > 1000
+    ):
         # Return just the child routes instead of full content
         child_routes = []
         for child in found_chapter["children"]:
             if "route" in child:
-                child_routes.append({
-                    "route": child["route"],
-                    "content_length": len(json.dumps(child))
-                })
+                child_routes.append(
+                    {"route": child["route"], "content_length": len(json.dumps(child))}
+                )
 
         # Create simplified chapter with only essential info and child routes
         simplified_chapter = {
@@ -189,7 +194,7 @@ def get_docs_chapter(route: str) -> str:
             "title": found_chapter.get("title", ""),
             "content_length": content_length,
             "note": "This chapter is large. Only child routes are shown. Request specific child routes for detailed content.",
-            "child_routes": child_routes
+            "child_routes": child_routes,
         }
         return json.dumps(simplified_chapter)
 
@@ -259,8 +264,18 @@ def latex_snippet_to_typst(latex_snippet) -> str:
     # run the pandoc command line tool and capture error output
     try:
         result = subprocess.run(
-            ["pandoc", os.path.join(temp_dir, "main.tex"), "--from=latex", "--to=typst", "--output", os.path.join(temp_dir, "main.typ")],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [
+                "pandoc",
+                os.path.join(temp_dir, "main.tex"),
+                "--from=latex",
+                "--to=typst",
+                "--output",
+                os.path.join(temp_dir, "main.typ"),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
@@ -335,7 +350,10 @@ def check_if_snippet_is_valid_typst_syntax(typst_snippet) -> str:
     try:
         subprocess.run(
             ["typst", "compile", os.path.join(temp_dir, "main.typ")],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         return "VALID"
     except subprocess.CalledProcessError as e:
@@ -411,8 +429,20 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
     # run the typst command line tool and capture the result
     try:
         subprocess.run(
-            ["typst", "compile", os.path.join(temp_dir, "main.typ"), "--format", "png", "--ppi", "500", os.path.join(temp_dir, "page{0p}.png")],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [
+                "typst",
+                "compile",
+                os.path.join(temp_dir, "main.typ"),
+                "--format",
+                "png",
+                "--ppi",
+                "500",
+                os.path.join(temp_dir, "page{0p}.png"),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
 
         # Find all generated pages
@@ -470,7 +500,9 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
         total_height = sum(page.height for page in pages)
 
         # Create a new image with the combined dimensions
-        combined_image = PILImage.new('RGB', (total_width, total_height), (255, 255, 255))
+        combined_image = PILImage.new(
+            "RGB", (total_width, total_height), (255, 255, 255)
+        )
 
         # Paste all pages vertically
         y_offset = 0

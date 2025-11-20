@@ -177,25 +177,39 @@ typst-mcp/
 │   ├── __init__.py         # Package initialization
 │   ├── server.py           # MCP server implementation
 │   └── build_docs.py       # Documentation build script
-├── vendor/                 # Git submodules
-│   └── typst/              # Typst source repository (submodule)
-├── typst-docs/             # Generated documentation (gitignored)
-│   ├── main.json           # Documentation JSON
-│   └── assets/             # Documentation assets
 ├── pyproject.toml          # Package configuration
 ├── README.md               # This file
 └── LICENSE                 # MIT License
+
+# Cache directory (created automatically):
+~/.cache/typst-mcp/         # Linux
+~/Library/Caches/typst-mcp/ # macOS
+%LOCALAPPDATA%\typst-mcp\   # Windows
+├── typst/                  # Cloned Typst repository
+└── typst-docs/             # Generated documentation
+    ├── main.json           # Documentation JSON
+    └── assets/             # Documentation assets
 ```
 
 ## How It Works
 
-1. **Automatic Setup**: On first run, the server checks if documentation exists. If not, it automatically builds it from the Typst source repository (included as a submodule). This is a one-time process.
+1. **Automatic Setup**: On first run, the server checks if documentation exists in the cache directory. If not, it automatically:
+   - Clones the Typst repository to the cache
+   - Builds documentation from source
+   - Stores everything in a persistent cache directory
 
 2. **Documentation Generation**: Uses the Typst source via Cargo to generate comprehensive, up-to-date documentation in JSON format with all function signatures, examples, and descriptions.
 
-3. **Smart Caching**: When using `uvx`, both the package and generated documentation are cached in the uvx environment. Subsequent runs start instantly without rebuilding.
+3. **Smart Caching & Auto-Updates**:
+   - Documentation is stored in platform-specific cache directories
+   - Persists across `uvx` runs and system updates
+   - **Automatic version tracking**: Tracks the Typst repository version used to build docs
+   - **Auto-rebuild**: Automatically detects and rebuilds when a new Typst version is available
+   - Subsequent server starts with same version are instant
 
-4. **Runtime Dependencies**: The server checks for required tools (`typst`, `pandoc`) on startup and provides helpful installation instructions if any are missing.
+4. **MCP Compatibility**: All build output goes to stderr, keeping stdout clean for JSON-RPC communication with MCP clients.
+
+5. **Runtime Dependencies**: The server checks for required tools (`typst`, `pandoc`) on startup and provides helpful installation instructions if any are missing.
 
 ## Troubleshooting
 
@@ -226,13 +240,28 @@ If you see warnings about missing `typst` or `pandoc`:
 - **Linux**: `apt install typst pandoc` (or equivalent for your distribution)
 - **Windows**: See installation links in Prerequisites section
 
-### Submodule not initialized
+### Updating to latest Typst documentation
 
-If the typst submodule is missing:
+The server automatically checks for Typst updates and rebuilds documentation when needed:
+
+- On each server start, it checks if the Typst repository has been updated
+- If a new version is detected, it automatically pulls the latest code and rebuilds
+- Version tracking is stored in `~/.cache/typst-mcp/typst-docs/.version` (or platform equivalent)
+
+**Manual cache clear** (if needed):
 
 ```bash
-git submodule update --init --depth=1 vendor/typst
+# macOS
+rm -rf ~/Library/Caches/typst-mcp
+
+# Linux
+rm -rf ~/.cache/typst-mcp
+
+# Windows
+rmdir /s %LOCALAPPDATA%\typst-mcp
 ```
+
+Then run the server again - it will automatically clone and build from scratch.
 
 ## JSON Schema of the Typst Documentation
 
