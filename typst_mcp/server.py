@@ -177,9 +177,7 @@ def list_child_routes(chapter: dict) -> list[dict]:
     return child_routes
 
 
-def create_pdf_resource(
-    pdf_bytes: bytes, name: str = "document.pdf"
-) -> EmbeddedResource:
+def create_pdf_resource(pdf_bytes: bytes, name: str = "document.pdf") -> list:
     """
     Creates an MCP EmbeddedResource containing a PDF file.
 
@@ -190,14 +188,24 @@ def create_pdf_resource(
     Returns:
         EmbeddedResource with BlobResourceContents containing base64-encoded PDF
     """
-    return EmbeddedResource(
-        type="resource",
-        resource=BlobResourceContents(
-            uri=AnyUrl(f"file:///{name}"),
-            mimeType="application/pdf",
-            blob=base64.b64encode(pdf_bytes).decode("ascii"),
-        ),
-    )
+    # return EmbeddedResource(
+    #     type="resource",
+    #     resource=BlobResourceContents(
+    #         uri=AnyUrl(f"file:///{name}"),
+    #         mimeType="application/pdf",
+    #         blob=base64.b64encode(pdf_bytes).decode("ascii"),
+    #     ),
+    # )
+    return [
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "data:application/pdf;base64",
+                "mimeType": "application/pdf",
+                "blob": base64.b64encode(pdf_bytes).decode("ascii"),
+            },
+        }
+    ]
 
 
 def get_pdf_output_dir() -> Path:
@@ -656,7 +664,7 @@ def typst_snippet_to_pdf(
     typst_snippet: str,
     output_mode: Literal["embedded", "path"] = "embedded",
     output_path: Optional[str] = None,
-) -> Image | str:
+) -> list | str:
     r"""
     Converts Typst code to a PDF document using the typst command line tool.
     Handles multi-page documents naturally (PDF format supports multiple pages).
@@ -679,7 +687,7 @@ def typst_snippet_to_pdf(
         - If error: String starting with "ERROR:" describing the failure
 
     Output modes:
-        - "embedded": Best for small-medium PDFs, returns Image object with PDF data
+        - "embedded": Best for small-medium PDFs, returns embedded resource object with PDF data
         - "path": Best for large PDFs or file-based workflows, returns file path,
                   no size overhead, files saved to temp directory (or custom path)
 
@@ -770,7 +778,7 @@ def typst_snippet_to_pdf(
             else:  # embedded mode (default)
                 # Return as Image object with PDF data
                 # Similar to typst_snippet_to_image, but with format="pdf"
-                return Image(data=pdf_bytes, format="pdf")
+                return create_pdf_resource(pdf_bytes)
 
         except subprocess.CalledProcessError as e:
             error_message = e.stderr.strip() if e.stderr else "Unknown error"
