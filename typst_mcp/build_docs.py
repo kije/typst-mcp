@@ -14,7 +14,17 @@ def eprint(*args, **kwargs):
 
 
 def get_cache_dir():
-    """Get the cache directory for typst-mcp data."""
+    """Get the cache directory for typst-mcp data.
+
+    Can be configured via TYPST_MCP_CACHE_DIR environment variable.
+    """
+    # Check for environment variable first
+    env_cache = os.environ.get("TYPST_MCP_CACHE_DIR")
+    if env_cache:
+        cache_dir = Path(env_cache).expanduser()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
     # Use platform-appropriate cache directory
     if sys.platform == "darwin":
         cache_base = Path.home() / "Library" / "Caches"

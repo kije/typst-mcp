@@ -57,3 +57,6 @@ dmypy.json
 # Temp files
 *.log
 *.tmp
+
+
+.claude/.storage
