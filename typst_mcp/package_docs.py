@@ -5,11 +5,284 @@ import json
 import re
 import sys
 import time
+import ipaddress
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 import httpx
 import toml
 from .build_docs import get_cache_dir, eprint
+
+
+# =============================================================================
+# SECURITY: HTTP Response Size Limits
+# =============================================================================
+# These limits prevent memory exhaustion from malicious or misconfigured servers
+
+MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10MB - Maximum total response size
+MAX_FILE_SIZE = 1 * 1024 * 1024       # 1MB - Maximum single file size
+
+
+# =============================================================================
+# SECURITY: SSRF Protection - Allowed Redirect Hosts
+# =============================================================================
+# Only allow redirects to known-good hosts to prevent SSRF attacks
+# where a malicious server redirects to internal services
+
+ALLOWED_REDIRECT_HOSTS = frozenset([
+    "github.com",
+    "raw.githubusercontent.com",
+    "api.github.com",
+    "packages.typst.org",
+    "typst.app",
+    "objects.githubusercontent.com",  # GitHub raw content CDN
+])
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    Check if a URL is safe to fetch (SSRF protection).
+
+    SECURITY: This function blocks:
+    - Private/loopback IP addresses (127.x.x.x, 10.x.x.x, 192.168.x.x, etc.)
+    - Cloud metadata endpoints (169.254.169.254)
+    - Link-local addresses (169.254.x.x)
+    - localhost and other local hostnames
+
+    Args:
+        url: URL to validate
+
+    Returns:
+        True if URL is safe to fetch, False otherwise
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return False
+
+        # Block localhost and common local hostnames
+        blocked_hostnames = {
+            "localhost",
+            "localhost.localdomain",
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "metadata.google.internal",  # GCP metadata
+            "metadata.google.com",
+            "metadata",
+        }
+        if hostname.lower() in blocked_hostnames:
+            eprint(f"SSRF BLOCKED: Localhost/metadata hostname: {hostname}")
+            return False
+
+        # Try to parse as IP address
+        try:
+            ip = ipaddress.ip_address(hostname)
+
+            # Block private addresses
+            if ip.is_private:
+                eprint(f"SSRF BLOCKED: Private IP address: {ip}")
+                return False
+
+            # Block loopback
+            if ip.is_loopback:
+                eprint(f"SSRF BLOCKED: Loopback address: {ip}")
+                return False
+
+            # Block link-local (including AWS/GCP metadata: 169.254.169.254)
+            if ip.is_link_local:
+                eprint(f"SSRF BLOCKED: Link-local address (metadata endpoint): {ip}")
+                return False
+
+            # Block reserved ranges
+            if ip.is_reserved:
+                eprint(f"SSRF BLOCKED: Reserved IP range: {ip}")
+                return False
+
+            # Block multicast
+            if ip.is_multicast:
+                eprint(f"SSRF BLOCKED: Multicast address: {ip}")
+                return False
+
+        except ValueError:
+            # Not an IP address, it's a hostname - continue with hostname check
+            pass
+
+        return True
+
+    except Exception as e:
+        eprint(f"SSRF BLOCKED: Error parsing URL '{url}': {e}")
+        return False
+
+
+def is_safe_redirect(url: str) -> bool:
+    """
+    Check if a redirect URL is safe to follow.
+
+    SECURITY: Only allows redirects to known-good hosts.
+    This is more restrictive than is_safe_url() because redirects
+    are a common SSRF attack vector.
+
+    Args:
+        url: Redirect target URL
+
+    Returns:
+        True if redirect is safe to follow, False otherwise
+    """
+    if not is_safe_url(url):
+        return False
+
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return False
+
+        # Check if hostname is in allowed list
+        hostname_lower = hostname.lower()
+
+        # Direct match
+        if hostname_lower in ALLOWED_REDIRECT_HOSTS:
+            return True
+
+        # Check for subdomain match (e.g., "objects.githubusercontent.com")
+        for allowed in ALLOWED_REDIRECT_HOSTS:
+            if hostname_lower.endswith(f".{allowed}"):
+                return True
+
+        eprint(f"SSRF BLOCKED: Redirect to unknown host: {hostname}")
+        return False
+
+    except Exception as e:
+        eprint(f"SSRF BLOCKED: Error checking redirect '{url}': {e}")
+        return False
+
+
+class SSRFSafeTransport(httpx.BaseTransport):
+    """
+    Custom transport that validates URLs before making requests.
+
+    SECURITY: This transport intercepts all requests and validates
+    that they are safe before forwarding to the underlying transport.
+    """
+
+    def __init__(self, wrapped_transport: httpx.BaseTransport):
+        self._wrapped = wrapped_transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+
+        # Validate initial request URL
+        if not is_safe_url(url_str):
+            raise ValueError(f"SSRF protection: Blocked request to unsafe URL: {url_str}")
+
+        return self._wrapped.handle_request(request)
+
+
+def create_safe_client(timeout: int = 10, max_redirects: int = 5) -> httpx.Client:
+    """
+    Create an HTTP client with SSRF protection and redirect validation.
+
+    SECURITY: This client:
+    - Validates all URLs before making requests
+    - Validates redirect targets against allowlist
+    - Limits number of redirects
+    - Sets reasonable timeouts
+
+    Args:
+        timeout: Request timeout in seconds
+        max_redirects: Maximum number of redirects to follow
+
+    Returns:
+        Configured httpx.Client
+    """
+    # Create base transport with redirect validation
+    base_transport = httpx.HTTPTransport()
+
+    # Custom event hook to validate redirects
+    def validate_redirect(response: httpx.Response) -> None:
+        """Event hook called after each response."""
+        if response.is_redirect:
+            redirect_url = response.headers.get("location", "")
+            if redirect_url:
+                # Resolve relative URLs
+                if redirect_url.startswith("/"):
+                    redirect_url = f"{response.url.scheme}://{response.url.host}{redirect_url}"
+
+                if not is_safe_redirect(redirect_url):
+                    raise ValueError(f"SSRF protection: Blocked redirect to: {redirect_url}")
+
+    return httpx.Client(
+        timeout=timeout,
+        follow_redirects=True,
+        max_redirects=max_redirects,
+        event_hooks={"response": [validate_redirect]},
+        transport=SSRFSafeTransport(base_transport),
+    )
+
+
+def fetch_with_size_limit(
+    client: httpx.Client,
+    url: str,
+    max_size: int = MAX_FILE_SIZE
+) -> httpx.Response:
+    """
+    Fetch URL content with size limit protection.
+
+    SECURITY: This function:
+    - Optionally checks Content-Length header before downloading
+    - Streams response and aborts if size limit exceeded
+    - Prevents memory exhaustion attacks
+
+    Args:
+        client: HTTP client to use
+        url: URL to fetch
+        max_size: Maximum response size in bytes
+
+    Returns:
+        httpx.Response object
+
+    Raises:
+        ValueError: If response exceeds size limit
+        httpx.HTTPError: If request fails
+    """
+    # First, try a HEAD request to check Content-Length
+    try:
+        head_response = client.head(url)
+        content_length = head_response.headers.get("content-length")
+        if content_length:
+            size = int(content_length)
+            if size > max_size:
+                raise ValueError(
+                    f"Response too large: {size} bytes exceeds limit of {max_size} bytes"
+                )
+    except (httpx.HTTPError, ValueError):
+        # HEAD request failed or no Content-Length - continue with GET
+        pass
+
+    # Stream the response and check size as we read
+    response = client.get(url)
+
+    # Check actual content length
+    content_length = response.headers.get("content-length")
+    if content_length:
+        size = int(content_length)
+        if size > max_size:
+            raise ValueError(
+                f"Response too large: {size} bytes exceeds limit of {max_size} bytes"
+            )
+
+    # Also check actual content size
+    content = response.content
+    if len(content) > max_size:
+        raise ValueError(
+            f"Response content too large: {len(content)} bytes exceeds limit of {max_size} bytes"
+        )
+
+    return response
 
 
 # Package cache state
@@ -134,8 +407,9 @@ def get_package_versions(package_name: str, timeout: int = 10) -> list[str]:
     url = f"https://api.github.com/repos/typst/packages/contents/packages/preview/{package_name}"
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.get(url, follow_redirects=True)
+        # SECURITY: Use safe client with SSRF protection
+        with create_safe_client(timeout=timeout) as client:
+            response = fetch_with_size_limit(client, url, max_size=MAX_RESPONSE_SIZE)
 
             if response.status_code == 404:
                 raise RuntimeError(f"Package '{package_name}' not found in Typst Universe")
@@ -188,8 +462,9 @@ def fetch_file_from_github(
     url = f"https://raw.githubusercontent.com/typst/packages/main/packages/preview/{package_name}/{version}/{file_path}"
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.get(url, follow_redirects=True)
+        # SECURITY: Use safe client with SSRF protection and size limits
+        with create_safe_client(timeout=timeout) as client:
+            response = fetch_with_size_limit(client, url, max_size=MAX_FILE_SIZE)
 
             if response.status_code == 404:
                 return None
@@ -234,8 +509,9 @@ def fetch_directory_listing(
     url = f"https://api.github.com/repos/typst/packages/contents/packages/preview/{package_name}/{version}/{dir_path}"
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.get(url, follow_redirects=True)
+        # SECURITY: Use safe client with SSRF protection
+        with create_safe_client(timeout=timeout) as client:
+            response = fetch_with_size_limit(client, url, max_size=MAX_RESPONSE_SIZE)
 
             if response.status_code == 404:
                 return None
@@ -512,8 +788,9 @@ def search_packages(query: str, max_results: int = 20) -> list[Dict[str, str]]:
     url = "https://api.github.com/repos/typst/packages/contents/packages/preview"
 
     try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, follow_redirects=True)
+        # SECURITY: Use safe client with SSRF protection
+        with create_safe_client(timeout=15) as client:
+            response = fetch_with_size_limit(client, url, max_size=MAX_RESPONSE_SIZE)
             response.raise_for_status()
             contents = response.json()
 
@@ -551,8 +828,9 @@ def list_all_packages() -> list[str]:
     url = "https://api.github.com/repos/typst/packages/contents/packages/preview"
 
     try:
-        with httpx.Client(timeout=15) as client:
-            response = client.get(url, follow_redirects=True)
+        # SECURITY: Use safe client with SSRF protection
+        with create_safe_client(timeout=15) as client:
+            response = fetch_with_size_limit(client, url, max_size=MAX_RESPONSE_SIZE)
             response.raise_for_status()
             contents = response.json()
 

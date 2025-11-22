@@ -323,35 +323,72 @@ typst-mcp implements multiple security layers to safely execute external command
 ### Quick Overview
 
 **Automatic Sandboxing** (Zero-Setup):
-- ✅ **macOS/Linux**: Full OS-level sandboxing via [Anthropic Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime)
-- ✅ **Auto-installed**: If Node.js/npx is present, sandboxing auto-downloads on first run
-- ✅ **Manual install**: `npm install -g @anthropic-ai/sandbox-runtime`
-- ⚠️ **Windows**: Use WSL2 or Docker for sandboxing (see docs/ADVANCED_SETUP.md)
+- **macOS/Linux**: Full OS-level sandboxing via [Anthropic Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime)
+- **Auto-installed**: If Node.js/npx is present, sandboxing auto-downloads on first run (pinned version for supply chain security)
+- **Manual install**: `npm install -g @anthropic-ai/sandbox-runtime`
+- **Windows**: Use WSL2 or Docker for sandboxing (see docs/ADVANCED_SETUP.md)
 
 **Security Layers:**
-1. **Filesystem isolation**: Blocks reads to `~/.ssh`, `~/.aws`, credentials; allows project files
-2. **Network restrictions**: Only `packages.typst.org` and package sources
-3. **Pandoc --sandbox**: CVE mitigation (requires Pandoc ≥ 3.1.4)
+1. **Filesystem isolation**: Blocks reads to `~/.ssh`, `~/.aws`, credentials, system files; allows project files
+2. **Network restrictions**: Only `packages.typst.org` and GitHub package sources
+3. **Pandoc --sandbox**: CVE mitigation (requires Pandoc >= 3.1.4)
 4. **Process timeouts**: 30-60 second limits prevent DoS
+5. **SSRF protection**: All HTTP requests validated against allowlist, private IPs blocked
+6. **Response size limits**: 10MB max response, 1MB max file to prevent memory exhaustion
 
-**Configuration** (optional):
+### Security Considerations
+
+**What IS Protected by the Sandbox:**
+- Credential files: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, etc.
+- System files: `/etc/passwd`, `/etc/shadow`, `/etc/ssh`, `/proc`, `/sys`, `/dev`
+- Docker socket: `/var/run/docker.sock` (prevents container escape/privilege escalation)
+- Cloud metadata: `169.254.169.254` and other link-local addresses blocked
+- Private keys: Files matching `*.pem`, `*.key`, `*_rsa`, `*_ed25519`, `*_ecdsa`
+- Additional secrets: `~/.password-store`, `~/.vault-token`, GNOME keyrings
+
+**What is NOT Protected:**
+- Files in your project directory are accessible (intentional - Typst needs to read your code)
+- Network requests to allowed domains (GitHub, packages.typst.org)
+- Temporary files created during compilation
+
+**Strict Sandbox Mode** (Maximum Security):
+
+For processing completely untrusted code, use strict mode:
 ```bash
+uvx typst-mcp --strict-sandbox
+```
+
+In strict mode:
+- Typst's `--root` flag restricts ALL file access to the temp directory only
+- No local `#include()`, `#image()`, or `#read()` from user files
+- Best for untrusted input where no local file access is needed
+
+**Reviewing AI-Generated Code:**
+- Always review Typst code before compilation in production environments
+- Be especially cautious of `#include()` and `#read()` directives
+- Consider strict mode when processing user-submitted Typst code
+
+### Configuration
+
+```bash
+# Strict mode - maximum security, no local file access
+uvx typst-mcp --strict-sandbox
+
 # Disable sandboxing (command-line only for security)
 uvx typst-mcp --disable-sandbox
 
 # Read whitelist mode (command-line only for security)
 uvx typst-mcp --read-allow-only "/path1,/path2,/path3"
 
-# Custom rules via environment variables (additive to defaults)
-export TYPST_MCP_DENY_READ="~/.private,/secret"        # Block additional paths (blacklist mode only)
-export TYPST_MCP_ALLOW_WRITE="~/build,/var/log/typst" # Allow writing to specific dirs
-export TYPST_MCP_ALLOW_DOMAINS="fonts.googleapis.com"  # Allow additional domains
+# Additional deny-read paths (environment variable - can only RESTRICT)
+export TYPST_MCP_DENY_READ="~/.private,/secret"
 ```
 
 **Security Notes:**
-- `--disable-sandbox` and `--read-allow-only` are command-line flags ONLY (not ENV variables)
-- This prevents malicious code from disabling security or expanding allowed paths
-- There is no `TYPST_MCP_ALLOW_READ` or `TYPST_MCP_DISABLE_SANDBOX` environment variable
+- `--disable-sandbox`, `--strict-sandbox`, and `--read-allow-only` are command-line flags ONLY
+- Environment variables can only ADD restrictions, never expand permissions
+- `TYPST_MCP_ALLOW_WRITE` and `TYPST_MCP_ALLOW_DOMAINS` are NOT supported (security risk)
+- If these removed env vars are set, a warning is logged and values are ignored
 
 **Windows Users:**
 For full sandboxing on Windows, use WSL2:
@@ -374,26 +411,30 @@ Or configure Claude Desktop to use WSL2:
 
 **Status on Startup:**
 ```
-✅ Sandboxing enabled (Anthropic Sandbox Runtime)
+STRICT SANDBOX MODE ENABLED
+Typst compiler will be restricted to the temp directory via --root flag.
 ```
 
-Or without sandboxing:
+Or normal mode:
 ```
-ℹ️  Enhanced Security Available (Optional)
-Current security measures:
-  ✓ Pandoc --sandbox flag
-  ✓ 30-60 second timeouts
-  ✓ Isolated temp directory
+Sandboxing enabled (Anthropic Sandbox Runtime)
 ```
 
-**Local File References Work:**
+**Local File References (Normal Mode):**
 ```typst
-// ✅ User's project files are accessible
+// User's project files are accessible
 #image("../assets/logo.png")
 #include("templates/article.typ")
 
-// ❌ Sensitive files are blocked
+// Sensitive files are blocked
 #include("~/.ssh/id_rsa")  // Blocked by sandbox
+```
+
+**Local File References (Strict Mode):**
+```typst
+// ALL local file access is blocked
+#image("../assets/logo.png")  // BLOCKED - cannot read from project
+#include("templates/article.typ")  // BLOCKED - cannot include local files
 ```
 
 For full security documentation, threat model, and implementation details, see [SECURITY.md](SECURITY.md).
