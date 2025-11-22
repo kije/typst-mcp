@@ -24,6 +24,7 @@ from fastmcp.utilities.types import Image, File
 
 # Import local modules
 from . import sandbox
+from .sandbox import get_typst_root_args, is_strict_mode
 from .settings import typst_settings
 from .models import (
     ChapterInfo,
@@ -32,7 +33,6 @@ from .models import (
     PackageSearchResult,
     ValidationResult,
     ConversionResult,
-    MCPErrorCodes,
     MAX_SNIPPET_LENGTH,
     MAX_LATEX_SNIPPET_LENGTH,
     MAX_QUERY_LENGTH,
@@ -347,35 +347,16 @@ async def list_docs_chapters(ctx: Context) -> str:
     return json.dumps(chapters)
 
 
-@mcp.tool()
-async def get_docs_chapter(route: str, ctx: Context) -> str:
-    """Gets a chapter by route.
+async def _get_docs_chapter_impl(route: str, ctx: Context) -> str:
+    """Internal implementation for getting a documentation chapter.
 
-    The route is the path to the chapter in the typst docs.
-    For example, the route "____reference____layout____colbreak" corresponds to
-    the chapter "reference/layout/colbreak".
-    The route uses underscores ("____") as path separators.
-
-    If a chapter has children and its content length is over 1000, this will only
-    return the child routes instead of the full content to avoid overwhelming responses.
-
-    Args:
-        route: Chapter route with ____ as path separator
-        ctx: MCP context for logging
-
-    Returns:
-        JSON string containing chapter content or child routes
-
-    Raises:
-        ResourceError: If documentation is not available or chapter not found
+    This is the core logic used by both get_docs_chapter and get_docs_chapters.
     """
-    _telemetry["tool_calls"]["get_docs_chapter"] += 1
     await ctx.debug(f"Fetching chapter: {route}")
 
     try:
         typst_docs = await get_docs(wait_seconds=10)
     except ResourceError as e:
-        _telemetry["errors"]["get_docs_chapter"] += 1
         await ctx.error(f"Documentation not available: {e}")
         raise
 
@@ -446,6 +427,36 @@ async def get_docs_chapter(route: str, ctx: Context) -> str:
 
 
 @mcp.tool()
+async def get_docs_chapter(route: str, ctx: Context) -> str:
+    """Gets a chapter by route.
+
+    The route is the path to the chapter in the typst docs.
+    For example, the route "____reference____layout____colbreak" corresponds to
+    the chapter "reference/layout/colbreak".
+    The route uses underscores ("____") as path separators.
+
+    If a chapter has children and its content length is over 1000, this will only
+    return the child routes instead of the full content to avoid overwhelming responses.
+
+    Args:
+        route: Chapter route with ____ as path separator
+        ctx: MCP context for logging
+
+    Returns:
+        JSON string containing chapter content or child routes
+
+    Raises:
+        ResourceError: If documentation is not available or chapter not found
+    """
+    _telemetry["tool_calls"]["get_docs_chapter"] += 1
+    try:
+        return await _get_docs_chapter_impl(route, ctx)
+    except ResourceError:
+        _telemetry["errors"]["get_docs_chapter"] += 1
+        raise
+
+
+@mcp.tool()
 async def get_docs_chapters(routes: list[str], ctx: Context) -> str:
     """Gets multiple chapters by their routes.
 
@@ -468,7 +479,7 @@ async def get_docs_chapters(routes: list[str], ctx: Context) -> str:
     results = []
     for route in routes:
         try:
-            chapter_json = await get_docs_chapter(route, ctx)
+            chapter_json = await _get_docs_chapter_impl(route, ctx)
             results.append(json.loads(chapter_json))
         except ResourceError as e:
             await ctx.warning(f"Failed to fetch chapter {route}: {e}")
@@ -476,6 +487,63 @@ async def get_docs_chapters(routes: list[str], ctx: Context) -> str:
 
     await ctx.info(f"Successfully fetched {len(results)} chapters")
     return json.dumps(results)
+
+
+async def _convert_latex_to_typst_impl(latex_snippet: str, ctx: Context) -> str:
+    """Internal implementation for LaTeX to Typst conversion.
+
+    This is the core logic used by both latex_snippet_to_typst and latex_snippets_to_typst.
+    """
+    # Input validation
+    if len(latex_snippet) > MAX_LATEX_SNIPPET_LENGTH:
+        _telemetry["errors"]["latex_snippet_to_typst"] += 1
+        await ctx.error(f"LaTeX snippet too large: {len(latex_snippet)} bytes")
+        raise ToolError(
+            f"LaTeX snippet too large: {len(latex_snippet)} bytes (max {MAX_LATEX_SNIPPET_LENGTH} bytes)"
+        )
+
+    await ctx.debug(f"Converting LaTeX snippet ({len(latex_snippet)} chars)")
+
+    # Write LaTeX to temp file (async)
+    tex_file = Path(temp_dir) / "main.tex"
+    typ_file = Path(temp_dir) / "main.typ"
+
+    await anyio.Path(tex_file).write_text(latex_snippet, encoding="utf-8")
+
+    # Run Pandoc conversion in thread pool (sandboxed)
+    try:
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                [
+                    "pandoc",
+                    "--sandbox",  # SECURITY: Prevent arbitrary file operations
+                    str(tex_file),
+                    "--from=latex",
+                    "--to=typst",
+                    "--output",
+                    str(typ_file),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=typst_settings.pandoc_timeout,
+            )
+        )
+    except subprocess.CalledProcessError as e:
+        _telemetry["errors"]["latex_snippet_to_typst"] += 1
+        error_message = e.stderr.strip() if e.stderr else "Unknown error"
+        await ctx.error(f"Pandoc conversion failed: {error_message}")
+        raise ToolError(
+            f"Failed to convert LaTeX to Typst. Pandoc error: {error_message}"
+        ) from e
+
+    # Read converted Typst code (async)
+    typst_code = await anyio.Path(typ_file).read_text(encoding="utf-8")
+    typst_code = typst_code.strip()
+
+    await ctx.info(f"Successfully converted to Typst ({len(typst_code)} chars)")
+    return typst_code
 
 
 @mcp.tool()
@@ -522,60 +590,7 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
         ```
     """
     _telemetry["tool_calls"]["latex_snippet_to_typst"] += 1
-
-    # Input validation
-    if len(latex_snippet) > MAX_LATEX_SNIPPET_LENGTH:
-        _telemetry["errors"]["latex_snippet_to_typst"] += 1
-        await ctx.error(f"LaTeX snippet too large: {len(latex_snippet)} bytes")
-        raise ToolError(
-            f"LaTeX snippet too large: {len(latex_snippet)} bytes (max {MAX_LATEX_SNIPPET_LENGTH} bytes)",
-            code=MCPErrorCodes.TIMEOUT,
-        )
-
-    await ctx.debug(f"Converting LaTeX snippet ({len(latex_snippet)} chars)")
-
-    # Write LaTeX to temp file (async)
-    tex_file = Path(temp_dir) / "main.tex"
-    typ_file = Path(temp_dir) / "main.typ"
-
-    await anyio.Path(tex_file).write_text(latex_snippet, encoding="utf-8")
-
-    # Run Pandoc conversion in thread pool (sandboxed)
-    try:
-        await anyio.to_thread.run_sync(
-            lambda: sandbox.run_sandboxed(
-                [
-                    "pandoc",
-                    "--sandbox",  # SECURITY: Prevent arbitrary file operations
-                    str(tex_file),
-                    "--from=latex",
-                    "--to=typst",
-                    "--output",
-                    str(typ_file),
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=typst_settings.pandoc_timeout,
-            )
-        )
-    except subprocess.CalledProcessError as e:
-        _telemetry["errors"]["latex_snippet_to_typst"] += 1
-        error_message = e.stderr.strip() if e.stderr else "Unknown error"
-        await ctx.error(f"Pandoc conversion failed: {error_message}")
-        raise ToolError(
-            f"Failed to convert LaTeX to Typst. Pandoc error: {error_message}",
-            code=MCPErrorCodes.OPERATION_FAILED,
-            details={"snippet_length": len(latex_snippet), "stderr": error_message},
-        ) from e
-
-    # Read converted Typst code (async)
-    typst_code = await anyio.Path(typ_file).read_text(encoding="utf-8")
-    typst_code = typst_code.strip()
-
-    await ctx.info(f"Successfully converted to Typst ({len(typst_code)} chars)")
-    return typst_code
+    return await _convert_latex_to_typst_impl(latex_snippet, ctx)
 
 
 @mcp.tool()
@@ -601,7 +616,7 @@ async def latex_snippets_to_typst(latex_snippets: list[str], ctx: Context) -> st
     results = []
     for i, snippet in enumerate(latex_snippets):
         try:
-            converted = await latex_snippet_to_typst(snippet, ctx)
+            converted = await _convert_latex_to_typst_impl(snippet, ctx)
             results.append(converted)
         except ToolError as e:
             await ctx.warning(f"Failed to convert snippet {i+1}: {e}")
@@ -609,6 +624,44 @@ async def latex_snippets_to_typst(latex_snippets: list[str], ctx: Context) -> st
 
     await ctx.info(f"Converted {len(results)} snippets")
     return json.dumps(results)
+
+
+async def _validate_typst_syntax_impl(typst_snippet: str, ctx: Context) -> str:
+    """Internal implementation for Typst syntax validation.
+
+    This is the core logic used by both check_if_snippet_is_valid_typst_syntax
+    and check_if_snippets_are_valid_typst_syntax.
+    """
+    # Input validation
+    if len(typst_snippet) > MAX_SNIPPET_LENGTH:
+        await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
+        return f"INVALID! Error message: Snippet too large ({len(typst_snippet)} bytes, max {MAX_SNIPPET_LENGTH} bytes)"
+
+    await ctx.debug(f"Validating Typst snippet ({len(typst_snippet)} chars)")
+
+    # Write to temp file (async)
+    typ_file = anyio.Path(temp_dir) / "main.typ"
+    await typ_file.write_text(typst_snippet, encoding="utf-8")
+
+    # Run validation in thread pool
+    # SECURITY: In strict mode, --root restricts file access to temp directory
+    try:
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                ["typst", "compile", *get_typst_root_args(temp_dir), str(typ_file)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,  # SECURITY: Prevent DoS from malicious code
+            )
+        )
+        await ctx.info("Syntax validation: VALID")
+        return "VALID"
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr.strip() if e.stderr else "Unknown error"
+        await ctx.debug(f"Syntax validation failed: {error_message[:100]}...")
+        return f"INVALID! Error message: {error_message}"
 
 
 @mcp.tool()
@@ -636,36 +689,7 @@ async def check_if_snippet_is_valid_typst_syntax(typst_snippet: str, ctx: Contex
         Output: "INVALID! Error message: {error: unknown variable: rac ...}"
     """
     _telemetry["tool_calls"]["check_if_snippet_is_valid_typst_syntax"] += 1
-
-    # Input validation
-    if len(typst_snippet) > MAX_SNIPPET_LENGTH:
-        await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
-        return f"INVALID! Error message: Snippet too large ({len(typst_snippet)} bytes, max {MAX_SNIPPET_LENGTH} bytes)"
-
-    await ctx.debug(f"Validating Typst snippet ({len(typst_snippet)} chars)")
-
-    # Write to temp file (async)
-    typ_file = anyio.Path(temp_dir) / "main.typ"
-    await typ_file.write_text(typst_snippet, encoding="utf-8")
-
-    # Run validation in thread pool
-    try:
-        await anyio.to_thread.run_sync(
-            lambda: sandbox.run_sandboxed(
-                ["typst", "compile", str(typ_file)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,  # SECURITY: Prevent DoS from malicious code
-            )
-        )
-        await ctx.info("Syntax validation: VALID")
-        return "VALID"
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else "Unknown error"
-        await ctx.debug(f"Syntax validation failed: {error_message[:100]}...")
-        return f"INVALID! Error message: {error_message}"
+    return await _validate_typst_syntax_impl(typst_snippet, ctx)
 
 
 @mcp.tool()
@@ -690,7 +714,7 @@ async def check_if_snippets_are_valid_typst_syntax(typst_snippets: list[str], ct
 
     results = []
     for i, snippet in enumerate(typst_snippets):
-        result = await check_if_snippet_is_valid_typst_syntax(snippet, ctx)
+        result = await _validate_typst_syntax_impl(snippet, ctx)
         results.append(result)
 
     valid_count = sum(1 for r in results if r == "VALID")
@@ -733,8 +757,7 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
         _telemetry["errors"]["typst_snippet_to_image"] += 1
         await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
         raise ToolError(
-            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
-            code=MCPErrorCodes.TIMEOUT,
+            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)"
         )
 
     await ctx.debug(f"Rendering Typst to image ({len(typst_snippet)} chars)")
@@ -744,12 +767,14 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
     await typ_file.write_text(typst_snippet, encoding="utf-8")
 
     # Run Typst compiler in thread pool
+    # SECURITY: In strict mode, --root restricts file access to temp directory
     try:
         await anyio.to_thread.run_sync(
             lambda: sandbox.run_sandboxed(
                 [
                     "typst",
                     "compile",
+                    *get_typst_root_args(temp_dir),
                     str(typ_file),
                     "--format",
                     "png",
@@ -769,9 +794,7 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
         await ctx.error(f"Typst compilation failed: {error_message[:100]}...")
         raise ToolError(
-            f"Failed to convert Typst to image: {error_message}",
-            code=MCPErrorCodes.OPERATION_FAILED,
-            details={"snippet_length": len(typst_snippet), "stderr": error_message},
+            f"Failed to convert Typst to image: {error_message}"
         ) from e
 
     # Find all generated pages (use async path checking)
@@ -966,8 +989,7 @@ async def typst_snippet_to_pdf(
         _telemetry["errors"]["typst_snippet_to_pdf"] += 1
         await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
         raise ToolError(
-            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
-            code=MCPErrorCodes.TIMEOUT,
+            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)"
         )
 
     await ctx.debug(f"Compiling Typst to PDF (mode: {output_mode}, {len(typst_snippet)} chars)")
@@ -987,9 +1009,10 @@ async def typst_snippet_to_pdf(
 
         # Compile to PDF (run in thread pool)
         # Note: anyio.to_thread.run_sync doesn't accept kwargs, so we use a lambda
+        # SECURITY: In strict mode, --root restricts file access to temp directory
         await anyio.to_thread.run_sync(
             lambda: sandbox.run_sandboxed(
-                ["typst", "compile", str(typ_file), str(pdf_file)],
+                ["typst", "compile", *get_typst_root_args(temp_dir), str(typ_file), str(pdf_file)],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1108,9 +1131,7 @@ async def typst_snippet_to_pdf(
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
         await ctx.error(f"Typst compilation failed: {error_message}")
         raise ToolError(
-            f"Failed to compile Typst to PDF: {error_message}",
-            code=MCPErrorCodes.OPERATION_FAILED,
-            details={"snippet_length": len(typst_snippet), "stderr": error_message},
+            f"Failed to compile Typst to PDF: {error_message}"
         ) from e
     finally:
         # Cleanup temp files (async)
@@ -1794,7 +1815,7 @@ async def search_packages(query: str, ctx: Context, max_results: int = 20) -> li
     # Input validation
     if len(query) > MAX_QUERY_LENGTH:
         await ctx.error(f"Query too long: {len(query)} chars")
-        raise ToolError(f"Query too long: {len(query)} chars (max {MAX_QUERY_LENGTH} chars)", code=MCPErrorCodes.TIMEOUT)
+        raise ToolError(f"Query too long: {len(query)} chars (max {MAX_QUERY_LENGTH} chars)")
 
     if max_results < 1 or max_results > MAX_RESULTS:
         await ctx.warning(f"max_results out of range, clamping to 1-{MAX_RESULTS}")
@@ -1814,7 +1835,7 @@ async def search_packages(query: str, ctx: Context, max_results: int = 20) -> li
     except Exception as e:
         _telemetry["errors"]["search_packages"] += 1
         await ctx.error(f"Package search failed: {e}")
-        raise ToolError(f"Failed to search packages: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Failed to search packages: {e}") from e
 
 
 @mcp.tool()
@@ -1882,7 +1903,7 @@ async def list_packages(ctx: Context, offset: int = 0, limit: int = 100) -> dict
     except Exception as e:
         _telemetry["errors"]["list_packages"] += 1
         await ctx.error(f"Failed to list packages: {e}")
-        raise ToolError(f"Failed to list packages: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Failed to list packages: {e}") from e
 
 
 @mcp.tool()
@@ -1918,11 +1939,11 @@ async def get_package_versions(package_name: str, ctx: Context) -> list[str]:
     except RuntimeError as e:
         _telemetry["errors"]["get_package_versions"] += 1
         await ctx.error(f"Failed to get versions: {e}")
-        raise ToolError(f"Failed to get package versions: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Failed to get package versions: {e}") from e
     except Exception as e:
         _telemetry["errors"]["get_package_versions"] += 1
         await ctx.error(f"Unexpected error: {e}")
-        raise ToolError(f"Unexpected error while fetching versions: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Unexpected error while fetching versions: {e}") from e
 
 
 @mcp.tool()
@@ -2014,13 +2035,12 @@ async def get_package_docs(
     except RuntimeError as e:
         _telemetry["errors"]["get_package_docs"] += 1
         await ctx.error(f"Failed to fetch docs: {e}")
-        raise ToolError(f"Failed to fetch package docs: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Failed to fetch package docs: {e}") from e
     except Exception as e:
         _telemetry["errors"]["get_package_docs"] += 1
         await ctx.error(f"Unexpected error: {e}")
         raise ToolError(
-            f"Unexpected error while fetching package documentation: {e}",
-            code=MCPErrorCodes.OPERATION_FAILED,
+            f"Unexpected error while fetching package documentation: {e}"
         ) from e
 
 
@@ -2062,8 +2082,7 @@ async def get_package_file(package_name: str, version: str, file_path: str, ctx:
         if content is None:
             raise ToolError(
                 f"File '{file_path}' not found in package '{package_name}@{version}'. "
-                f"Use get_package_docs(summary=True) to see available files.",
-                code=MCPErrorCodes.OPERATION_FAILED,
+                f"Use get_package_docs(summary=True) to see available files."
             )
 
         await ctx.info(f"Fetched file ({len(content)} bytes)")
@@ -2081,7 +2100,7 @@ async def get_package_file(package_name: str, version: str, file_path: str, ctx:
     except Exception as e:
         _telemetry["errors"]["get_package_file"] += 1
         await ctx.error(f"Failed to fetch file: {e}")
-        raise ToolError(f"Failed to fetch package file: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
+        raise ToolError(f"Failed to fetch package file: {e}") from e
 
 
 @mcp.prompt()

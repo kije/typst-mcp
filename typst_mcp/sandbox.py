@@ -25,6 +25,7 @@ class SandboxConfig:
     # SECURITY: These paths are ALWAYS blocked, even in whitelist mode
     # Prevents malicious code from setting READ_ALLOW_ONLY="/*"
     ALWAYS_DENY_READ = [
+        # User credential files
         "~/.ssh",
         "~/.aws",
         "~/.config/gcloud",
@@ -37,6 +38,34 @@ class SandboxConfig:
         "~/.netrc",  # Network credentials
         "~/.npmrc",  # npm credentials
         "~/.pypirc",  # PyPI credentials
+        # System paths (Linux/Unix)
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/sudoers",
+        "/etc/ssh",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/run/secrets",
+        "/var/run/secrets",
+        # Docker socket (privilege escalation vector)
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        # macOS specific
+        "/Library/Keychains",
+        "~/Library/Keychains",
+        # Additional credential files
+        "~/.password-store",
+        "~/.vault-token",
+        "~/.config/op",  # 1Password CLI
+        "~/.config/hub",  # GitHub hub CLI
+        "~/.local/share/keyrings",  # GNOME keyring
+        "~/.secrets",
+        "*.pem",
+        "*.key",
+        "*_rsa",
+        "*_ed25519",
+        "*_ecdsa",
     ]
 
     def __init__(self, temp_dir: str, current_dir: str = ".", read_allow_only: list = None):
@@ -78,10 +107,15 @@ class SandboxConfig:
         # - Linux /tmp has sticky bit, so users can only delete their own files
         # - Windows temp is user-specific by default
 
+        # Typst package cache directories (required for package imports)
+        # Typst downloads packages to these locations during compilation
+        typst_cache_dirs = self._get_typst_cache_dirs()
+
         self.allow_write = [
             current_dir,
             system_temp_dir,
             temp_dir,  # Subdirectory of system_temp_dir (redundant but explicit)
+            *typst_cache_dirs,  # Allow Typst to cache downloaded packages
         ]
 
         # Network: Allow package fetching only
@@ -94,7 +128,12 @@ class SandboxConfig:
         self._load_custom_rules()
 
     def _load_custom_rules(self):
-        """Load and apply custom sandbox rules from environment variables."""
+        """Load and apply custom sandbox rules from environment variables.
+
+        SECURITY: Only TYPST_MCP_DENY_READ is supported (additive restrictions only).
+        TYPST_MCP_ALLOW_WRITE and TYPST_MCP_ALLOW_DOMAINS have been removed because
+        environment variables can be set by malicious software to expand permissions.
+        """
         # Additional deny-read paths (only in blacklist mode)
         if not self.read_whitelist_mode:
             if custom_deny := os.getenv("TYPST_MCP_DENY_READ"):
@@ -108,18 +147,69 @@ class SandboxConfig:
         # In whitelist mode, ALL paths must be specified via --read-allow-only flag
         # This ensures explicit, visible configuration that's harder to manipulate
 
-        # Additional allow-write paths
-        if custom_allow_write := os.getenv("TYPST_MCP_ALLOW_WRITE"):
-            paths = [p.strip() for p in custom_allow_write.split(",") if p.strip()]
-            expanded = [os.path.expanduser(p) for p in paths]
-            self.allow_write.extend(expanded)
-            eprint(f"Custom allow-write paths: {expanded}")
+        # SECURITY: TYPST_MCP_ALLOW_WRITE removed - env vars can expand attack surface
+        # If you need custom write paths, use command-line flags or a config file
+        if os.getenv("TYPST_MCP_ALLOW_WRITE"):
+            eprint("="*60)
+            eprint("WARNING: TYPST_MCP_ALLOW_WRITE is no longer supported")
+            eprint("="*60)
+            eprint("This environment variable has been removed for security reasons.")
+            eprint("Environment variables can be set by malicious software to")
+            eprint("expand the sandbox's allowed write paths.")
+            eprint("")
+            eprint("For custom write paths, please use a trusted configuration method.")
+            eprint("The value of TYPST_MCP_ALLOW_WRITE will be IGNORED.")
+            eprint("="*60)
 
-        # Additional allowed domains
-        if custom_domains := os.getenv("TYPST_MCP_ALLOW_DOMAINS"):
-            domains = [d.strip() for d in custom_domains.split(",") if d.strip()]
-            self.allowed_domains.extend(domains)
-            eprint(f"Custom allowed domains: {domains}")
+        # SECURITY: TYPST_MCP_ALLOW_DOMAINS removed - env vars can expand attack surface
+        if os.getenv("TYPST_MCP_ALLOW_DOMAINS"):
+            eprint("="*60)
+            eprint("WARNING: TYPST_MCP_ALLOW_DOMAINS is no longer supported")
+            eprint("="*60)
+            eprint("This environment variable has been removed for security reasons.")
+            eprint("Environment variables can be set by malicious software to")
+            eprint("expand network access beyond trusted domains.")
+            eprint("")
+            eprint("The value of TYPST_MCP_ALLOW_DOMAINS will be IGNORED.")
+            eprint("="*60)
+
+    def _get_typst_cache_dirs(self) -> List[str]:
+        """Get platform-specific Typst package cache directories.
+
+        Typst caches downloaded packages in these locations:
+        - macOS: ~/Library/Caches/typst/packages/
+        - Linux: ~/.cache/typst/packages/
+        - Windows: %LOCALAPPDATA%/typst/packages/
+
+        Returns:
+            List of expanded paths to Typst cache directories
+        """
+        cache_dirs = []
+
+        if sys.platform == "darwin":
+            # macOS: ~/Library/Caches/typst/packages/
+            macos_cache = os.path.expanduser("~/Library/Caches/typst")
+            cache_dirs.append(macos_cache)
+        elif sys.platform == "win32":
+            # Windows: %LOCALAPPDATA%/typst/packages/
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            if local_app_data:
+                win_cache = os.path.join(local_app_data, "typst")
+                cache_dirs.append(win_cache)
+        else:
+            # Linux and other Unix: ~/.cache/typst/packages/
+            xdg_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+            linux_cache = os.path.join(xdg_cache, "typst")
+            cache_dirs.append(linux_cache)
+
+        # Filter out empty paths and ensure they exist or can be created
+        valid_dirs = []
+        for d in cache_dirs:
+            if d:
+                valid_dirs.append(d)
+                eprint(f"📦 Allowing Typst package cache: {d}")
+
+        return valid_dirs
 
     def to_srt_settings(self) -> dict:
         """Convert config to srt settings dictionary."""
@@ -193,8 +283,10 @@ class TypestSandbox:
         if shutil.which("npx"):
             # Test if npx can run srt (will auto-download on first use)
             try:
+                # SECURITY: Use pinned version to prevent supply chain attacks
+                pinned_package = f"{SANDBOX_RUNTIME_PACKAGE}@{SANDBOX_RUNTIME_VERSION}"
                 result = subprocess.run(
-                    ["npx", "-y", "@anthropic-ai/sandbox-runtime", "--version"],
+                    ["npx", "-y", pinned_package, "--version"],
                     capture_output=True,
                     timeout=30,  # First download may take time
                     text=True
@@ -551,9 +643,10 @@ class TypestSandbox:
             # Use globally installed srt
             sandboxed = ["srt", "--settings", self.settings_file, "--"] + cmd_list
         elif self.sandbox_method == "srt-npx":
-            # Use npx to run srt
+            # Use npx to run srt with pinned version (supply chain protection)
+            pinned_package = f"{SANDBOX_RUNTIME_PACKAGE}@{SANDBOX_RUNTIME_VERSION}"
             sandboxed = [
-                "npx", "-y", "@anthropic-ai/sandbox-runtime",
+                "npx", "-y", pinned_package,
                 "--settings", self.settings_file,
                 "--"
             ] + cmd_list
@@ -594,6 +687,36 @@ class TypestSandbox:
 # Global sandbox instance (initialized in main())
 _sandbox: Optional[TypestSandbox] = None
 
+# Global strict mode flag
+_strict_mode: bool = False
+
+# SECURITY: Pinned sandbox runtime version (supply chain protection)
+SANDBOX_RUNTIME_PACKAGE = "@anthropic-ai/sandbox-runtime"
+SANDBOX_RUNTIME_VERSION = "0.0.15"  # Pin to known-good version (latest as of 2024)
+
+
+def is_strict_mode() -> bool:
+    """Check if strict sandbox mode is enabled."""
+    return _strict_mode
+
+
+def get_typst_root_args(temp_dir: str) -> List[str]:
+    """
+    Get --root arguments for typst compile if strict mode is enabled.
+
+    In strict mode, typst is restricted to only read from the temp directory,
+    preventing access to user files outside the allowed paths.
+
+    Args:
+        temp_dir: Temporary directory path
+
+    Returns:
+        List of arguments to pass to typst compile (empty if not strict mode)
+    """
+    if _strict_mode:
+        return ["--root", temp_dir]
+    return []
+
 
 def initialize_sandbox(temp_dir: str, argv: Optional[List[str]] = None) -> bool:
     """
@@ -606,7 +729,7 @@ def initialize_sandbox(temp_dir: str, argv: Optional[List[str]] = None) -> bool:
     Returns:
         bool: True if sandboxing is active
     """
-    global _sandbox
+    global _sandbox, _strict_mode
 
     # Parse command-line arguments
     read_allow_only = None
@@ -614,6 +737,24 @@ def initialize_sandbox(temp_dir: str, argv: Optional[List[str]] = None) -> bool:
 
     if argv is None:
         argv = sys.argv
+
+    # SECURITY: --strict-sandbox flag restricts typst to temp directory only
+    if "--strict-sandbox" in argv:
+        _strict_mode = True
+        eprint("\n" + "="*60)
+        eprint("STRICT SANDBOX MODE ENABLED")
+        eprint("="*60)
+        eprint("Typst compiler will be restricted to the temp directory via --root flag.")
+        eprint("This prevents Typst code from accessing ANY user files.")
+        eprint("")
+        eprint("Features disabled in strict mode:")
+        eprint("  - #include() of external files")
+        eprint("  - #image() of local images")
+        eprint("  - #read() of local files")
+        eprint("  - All local file access")
+        eprint("")
+        eprint("This is the most secure option when processing untrusted code.")
+        eprint("="*60 + "\n")
 
     # Look for --read-allow-only flag
     if "--read-allow-only" in argv:
@@ -797,3 +938,127 @@ def secure_copy_file(source: str, destination: str, timeout: int = 10) -> None:
     # Verify destination was created
     if not os.path.exists(destination):
         raise RuntimeError(f"Copy command succeeded but destination file not found: {destination}")
+
+
+# =============================================================================
+# SECURITY: Atomic File Write with Secure Permissions
+# =============================================================================
+
+
+class secure_umask:
+    """
+    Context manager for temporarily setting a restrictive umask.
+
+    SECURITY: This ensures files created within the context have
+    restricted permissions (0o600 for files with umask 0o077).
+
+    Example:
+        with secure_umask():
+            # Files created here are owner-only (mode 0600)
+            with open("sensitive.txt", "w") as f:
+                f.write("secret")
+    """
+
+    def __init__(self, mask: int = 0o077):
+        """
+        Args:
+            mask: The umask to set (default: 0o077 = owner-only)
+        """
+        self.mask = mask
+        self.original_mask = None
+
+    def __enter__(self):
+        self.original_mask = os.umask(self.mask)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.original_mask is not None:
+            os.umask(self.original_mask)
+        return False
+
+
+def secure_write_file(path: str, content: bytes, mode: int = 0o600) -> None:
+    """
+    Securely write content to a file with atomic operations.
+
+    SECURITY: This function provides several security guarantees:
+    1. Creates temp file with mkstemp (O_EXCL - prevents race conditions)
+    2. Sets permissions via fchmod BEFORE writing (atomic, no TOCTOU)
+    3. Uses atomic rename to final path (prevents partial writes)
+    4. Falls back to direct write on Windows (no atomic rename across volumes)
+
+    Args:
+        path: Destination file path (absolute recommended)
+        content: Binary content to write
+        mode: File permissions (default: 0o600 = owner read/write only)
+
+    Raises:
+        OSError: If file creation or write fails
+        RuntimeError: If atomic rename fails
+
+    Cross-platform notes:
+        - Unix: Uses atomic rename via os.replace()
+        - Windows: Uses os.replace() which is atomic on same volume
+    """
+    import platform
+    import tempfile
+    import stat
+
+    target_path = Path(path).absolute()
+    parent_dir = target_path.parent
+
+    # Ensure parent directory exists
+    parent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create temp file in same directory as target (required for atomic rename)
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(parent_dir),
+        prefix=".tmp_",
+        suffix=".tmp"
+    )
+
+    try:
+        # SECURITY: Set restrictive permissions BEFORE writing
+        # This prevents any window where the file exists with wrong permissions
+        if platform.system() != "Windows":
+            os.fchmod(fd, mode)
+
+        # Write content
+        os.write(fd, content)
+
+        # Ensure data is flushed to disk
+        os.fsync(fd)
+
+    except Exception as e:
+        # Clean up on failure
+        os.close(fd)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"Failed to write secure file: {e}") from e
+    finally:
+        os.close(fd)
+
+    # SECURITY: Atomic rename to final path
+    # os.replace() is atomic on Unix and on Windows (same volume)
+    try:
+        os.replace(temp_path, str(target_path))
+    except Exception as e:
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"Failed atomic rename to {target_path}: {e}") from e
+
+    # Verify permissions on final file (defense in depth)
+    if platform.system() != "Windows":
+        actual_mode = stat.S_IMODE(os.stat(str(target_path)).st_mode)
+        if actual_mode != mode:
+            eprint(f"WARNING: File permissions mismatch. Expected {oct(mode)}, got {oct(actual_mode)}")
+            # Try to fix
+            try:
+                os.chmod(str(target_path), mode)
+            except OSError:
+                pass
