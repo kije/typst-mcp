@@ -1,10 +1,8 @@
 from collections import Counter
-from contextlib import asynccontextmanager
 from datetime import datetime
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
 from typing import Literal
-import base64
 import io
 import json
 import os
@@ -13,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import anyio
 import numpy as np
@@ -33,6 +32,7 @@ from .models import (
     PackageSearchResult,
     ValidationResult,
     ConversionResult,
+    MCPErrorCodes,
     MAX_SNIPPET_LENGTH,
     MAX_LATEX_SNIPPET_LENGTH,
     MAX_QUERY_LENGTH,
@@ -58,8 +58,19 @@ _docs_state = {
     "building": False,
     "error": None,
     "docs": None,
-    "lock": anyio.Lock(),
+    "lock": None,  # Lazy initialize to avoid race condition at module import
 }
+
+
+async def _get_docs_lock() -> anyio.Lock:
+    """Get or create the docs state lock (lazy initialization).
+
+    This avoids creating anyio.Lock() at module import time before
+    any event loop exists, which would cause a race condition.
+    """
+    if _docs_state["lock"] is None:
+        _docs_state["lock"] = anyio.Lock()
+    return _docs_state["lock"]
 
 # Privacy-preserving telemetry (no user data)
 _telemetry = {
@@ -68,42 +79,11 @@ _telemetry = {
     "errors": Counter(),
 }
 
-# Package cache (for resource handlers)
-_package_cache: dict[str, dict] = {}
+# Import package cache from package_docs module (single source of truth)
+from .package_docs import _package_cache
 
 # Maximum results for list/search operations
 MAX_RESULTS = 1000
-
-
-def eprint(*args, **kwargs):
-    """
-    DEPRECATED: Use logger instead.
-    Legacy function for backward compatibility with non-modernized code.
-
-    For new code, use:
-    - logger.debug() for debug messages
-    - logger.info() for informational messages
-    - logger.warning() for warnings
-    - logger.error() for errors
-
-    Or use Context logging inside tools:
-    - await ctx.debug()
-    - await ctx.info()
-    - await ctx.warning()
-    - await ctx.error()
-    """
-    # Convert to logger for proper FastMCP integration
-    message = " ".join(str(arg) for arg in args)
-
-    # Determine log level based on content
-    if "ERROR" in message or "Error" in message or "failed" in message.lower():
-        logger.error(message)
-    elif "WARNING" in message or "Warning" in message:
-        logger.warning(message)
-    elif "✓" in message or "success" in message.lower():
-        logger.info(message)
-    else:
-        logger.debug(message)
 
 
 def check_dependencies():
@@ -119,16 +99,16 @@ def check_dependencies():
             missing.append(f"  - {tool}: {info}")
 
     if missing:
-        eprint("\n" + "=" * 60)
-        eprint("WARNING: Missing required external tools:")
-        eprint("=" * 60)
+        logger.warning("=" * 60)
+        logger.warning("Missing required external tools:")
+        logger.warning("=" * 60)
         for msg in missing:
-            eprint(msg)
-        eprint("\nInstallation instructions:")
-        eprint("  macOS:   brew install typst pandoc")
-        eprint("  Linux:   apt install typst pandoc  # or your package manager")
-        eprint("  Windows: See installation links above")
-        eprint("=" * 60 + "\n")
+            logger.warning(msg)
+        logger.warning("Installation instructions:")
+        logger.warning("  macOS:   brew install typst pandoc")
+        logger.warning("  Linux:   apt install typst pandoc  # or your package manager")
+        logger.warning("  Windows: See installation links above")
+        logger.warning("=" * 60)
 
 
 async def build_docs_background(ctx: Context | None = None):
@@ -136,7 +116,8 @@ async def build_docs_background(ctx: Context | None = None):
     from .build_docs import build_typst_docs
     from . import package_docs  # Import package_docs module to initialize it
 
-    async with _docs_state["lock"]:
+    lock = await _get_docs_lock()
+    async with lock:
         if _docs_state["loaded"] or _docs_state["building"]:
             return
         _docs_state["building"] = True
@@ -157,7 +138,7 @@ async def build_docs_background(ctx: Context | None = None):
                 content = await f.read()
                 docs_data = json.loads(content)
 
-            async with _docs_state["lock"]:
+            async with lock:
                 _docs_state["docs"] = docs_data
                 _docs_state["loaded"] = True
                 _docs_state["building"] = False
@@ -183,7 +164,7 @@ async def build_docs_background(ctx: Context | None = None):
         success = await anyio.to_thread.run_sync(build_typst_docs)
 
         if not success:
-            async with _docs_state["lock"]:
+            async with lock:
                 _docs_state["error"] = "Failed to build documentation"
                 _docs_state["building"] = False
 
@@ -201,7 +182,7 @@ async def build_docs_background(ctx: Context | None = None):
             content = await f.read()
             docs_data = json.loads(content)
 
-        async with _docs_state["lock"]:
+        async with lock:
             _docs_state["docs"] = docs_data
             _docs_state["loaded"] = True
             _docs_state["building"] = False
@@ -217,7 +198,7 @@ async def build_docs_background(ctx: Context | None = None):
         logger.info("=" * 60)
 
     except Exception as e:
-        async with _docs_state["lock"]:
+        async with lock:
             _docs_state["error"] = str(e)
             _docs_state["building"] = False
 
@@ -304,12 +285,12 @@ def cleanup_old_pdfs(directory: Path, max_age_hours: int = 24):
                     pdf_file.unlink()
                     cleaned_count += 1
             except Exception as e:
-                eprint(f"Warning: Could not delete {pdf_file.name}: {e}")
+                logger.warning(f"Could not delete {pdf_file.name}: {e}")
 
         if cleaned_count > 0:
-            eprint(f"✓ Cleaned up {cleaned_count} old PDF(s)")
+            logger.debug(f"Cleaned up {cleaned_count} old PDF(s)")
     except Exception as e:
-        eprint(f"Warning: PDF cleanup failed: {e}")
+        logger.warning(f"PDF cleanup failed: {e}")
 
 
 def get_pdf_output_dir() -> Path:
@@ -548,7 +529,7 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
         await ctx.error(f"LaTeX snippet too large: {len(latex_snippet)} bytes")
         raise ToolError(
             f"LaTeX snippet too large: {len(latex_snippet)} bytes (max {MAX_LATEX_SNIPPET_LENGTH} bytes)",
-            code=-32003,
+            code=MCPErrorCodes.TIMEOUT,
         )
 
     await ctx.debug(f"Converting LaTeX snippet ({len(latex_snippet)} chars)")
@@ -585,7 +566,7 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
         await ctx.error(f"Pandoc conversion failed: {error_message}")
         raise ToolError(
             f"Failed to convert LaTeX to Typst. Pandoc error: {error_message}",
-            code=-32001,
+            code=MCPErrorCodes.OPERATION_FAILED,
             details={"snippet_length": len(latex_snippet), "stderr": error_message},
         ) from e
 
@@ -753,7 +734,7 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
         await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
         raise ToolError(
             f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
-            code=-32003,
+            code=MCPErrorCodes.TIMEOUT,
         )
 
     await ctx.debug(f"Rendering Typst to image ({len(typst_snippet)} chars)")
@@ -789,14 +770,14 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
         await ctx.error(f"Typst compilation failed: {error_message[:100]}...")
         raise ToolError(
             f"Failed to convert Typst to image: {error_message}",
-            code=-32001,
+            code=MCPErrorCodes.OPERATION_FAILED,
             details={"snippet_length": len(typst_snippet), "stderr": error_message},
         ) from e
 
-    # Find all generated pages
+    # Find all generated pages (use async path checking)
     page_files = []
     page_num = 1
-    while os.path.exists(os.path.join(temp_dir, f"page{page_num}.png")):
+    while await anyio.Path(os.path.join(temp_dir, f"page{page_num}.png")).exists():
         page_files.append(os.path.join(temp_dir, f"page{page_num}.png"))
         page_num += 1
 
@@ -812,37 +793,38 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
         """Process and combine page images (runs in thread pool)."""
         pages = []
         for page_file in page_files:
-            img = PILImage.open(page_file)
-            img_array = np.array(img)
+            # Use context manager to ensure PIL images are properly closed
+            with PILImage.open(page_file) as img:
+                img_array = np.array(img)
 
-            # Check if the image is RGB
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                # Find non-white pixels (R,G,B not all 255)
-                non_white = np.where(~np.all(img_array == 255, axis=2))
-            else:
-                # For grayscale images
-                non_white = np.where(img_array < 255)
+                # Check if the image is RGB
+                if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                    # Find non-white pixels (R,G,B not all 255)
+                    non_white = np.where(~np.all(img_array == 255, axis=2))
+                else:
+                    # For grayscale images
+                    non_white = np.where(img_array < 255)
 
-            if len(non_white[0]) > 0:  # If there are non-white pixels
-                # Find bounding box
-                top = non_white[0].min()
-                bottom = non_white[0].max()
-                left = non_white[1].min()
-                right = non_white[1].max()
+                if len(non_white[0]) > 0:  # If there are non-white pixels
+                    # Find bounding box
+                    top = non_white[0].min()
+                    bottom = non_white[0].max()
+                    left = non_white[1].min()
+                    right = non_white[1].max()
 
-                # Add some padding (10px on each side)
-                padding = 10
-                top = max(0, top - padding)
-                bottom = min(img.height - 1, bottom + padding)
-                left = max(0, left - padding)
-                right = min(img.width - 1, right + padding)
+                    # Add some padding (10px on each side)
+                    padding = 10
+                    top = max(0, top - padding)
+                    bottom = min(img.height - 1, bottom + padding)
+                    left = max(0, left - padding)
+                    right = min(img.width - 1, right + padding)
 
-                # Crop image to bounding box
-                cropped_img = img.crop((left, top, right + 1, bottom + 1))
-                pages.append(cropped_img)
-            else:
-                # If image is completely white, keep it as is
-                pages.append(img)
+                    # Crop image to bounding box and copy to avoid reference to closed image
+                    cropped_img = img.crop((left, top, right + 1, bottom + 1)).copy()
+                    pages.append(cropped_img)
+                else:
+                    # If image is completely white, copy it to avoid reference to closed image
+                    pages.append(img.copy())
 
         if not pages:
             raise ValueError("Failed to process page images")
@@ -860,10 +842,13 @@ async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
             x_offset = (total_width - page.width) // 2
             combined_image.paste(page, (x_offset, y_offset))
             y_offset += page.height
+            # Close the copied page image after pasting
+            page.close()
 
         # Save to bytes
         img_bytes_io = io.BytesIO()
         combined_image.save(img_bytes_io, format="PNG")
+        combined_image.close()
         return img_bytes_io.getvalue()
 
     try:
@@ -982,7 +967,7 @@ async def typst_snippet_to_pdf(
         await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
         raise ToolError(
             f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
-            code=-32003,
+            code=MCPErrorCodes.TIMEOUT,
         )
 
     await ctx.debug(f"Compiling Typst to PDF (mode: {output_mode}, {len(typst_snippet)} chars)")
@@ -991,151 +976,150 @@ async def typst_snippet_to_pdf(
     if typst_settings.enable_progress_reporting:
         await ctx.report_progress(0, 100, "Starting PDF compilation")
 
-    # Create unique temporary directory
-    async with anyio.create_task_group() as tg:
-        # Create temp files
-        typ_file = Path(temp_dir) / f"main_{id(tg)}.typ"
-        pdf_file = Path(temp_dir) / f"output_{id(tg)}.pdf"
+    # Create unique temp files using uuid instead of task group ID hack
+    unique_id = uuid.uuid4().hex[:8]
+    typ_file = Path(temp_dir) / f"main_{unique_id}.typ"
+    pdf_file = Path(temp_dir) / f"output_{unique_id}.pdf"
 
-        try:
-            # Write snippet (async)
-            await anyio.Path(typ_file).write_text(typst_snippet, encoding="utf-8")
+    try:
+        # Write snippet (async)
+        await anyio.Path(typ_file).write_text(typst_snippet, encoding="utf-8")
 
-            # Compile to PDF (run in thread pool)
-            # Note: anyio.to_thread.run_sync doesn't accept kwargs, so we use a lambda
-            await anyio.to_thread.run_sync(
-                lambda: sandbox.run_sandboxed(
-                    ["typst", "compile", str(typ_file), str(pdf_file)],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=typst_settings.typst_compile_timeout,
-                )
+        # Compile to PDF (run in thread pool)
+        # Note: anyio.to_thread.run_sync doesn't accept kwargs, so we use a lambda
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                ["typst", "compile", str(typ_file), str(pdf_file)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=typst_settings.typst_compile_timeout,
+            )
+        )
+
+        # Read PDF bytes (async)
+        pdf_bytes = await anyio.Path(pdf_file).read_bytes()
+
+        await ctx.debug(f"Generated PDF ({len(pdf_bytes)} bytes)")
+
+        # Progress reporting
+        if typst_settings.enable_progress_reporting:
+            await ctx.report_progress(80, 100, "PDF generated, preparing output")
+
+        # Return based on output mode
+        if output_mode == "path":
+            # Determine output path
+            if output_path:
+                # Use custom filepath (must be absolute)
+                final_path = Path(output_path).absolute()
+
+                # SECURITY: Use sandboxed copy instead of Python file I/O
+                # This ensures sandbox restrictions are enforced by the OS, not our code
+                # Avoids vulnerabilities: symlinks, path traversal, race conditions, etc.
+
+                try:
+                    # Use secure_copy_file (cross-platform, sandbox-enforced, async)
+                    await anyio.to_thread.run_sync(
+                        partial(
+                            sandbox.secure_copy_file,
+                            str(pdf_file),
+                            str(final_path),
+                            timeout=10,
+                        )
+                    )
+
+                    # SECURITY: Restrict file permissions to owner-only (0600)
+                    try:
+                        await anyio.to_thread.run_sync(os.chmod, final_path, 0o600)
+                    except Exception as chmod_err:
+                        logger.warning(f"Could not restrict PDF permissions: {chmod_err}")
+
+                except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
+                    # Sandbox blocked the operation or copy failed
+                    if isinstance(e, subprocess.CalledProcessError):
+                        error_msg = e.stderr.strip() if e.stderr else "Permission denied or path not allowed"
+                    else:
+                        error_msg = str(e)
+
+                    # Get allowed directories for helpful error message
+                    sb = sandbox.get_sandbox()
+                    allowed_dirs = sb.config.allow_write if sb and sb.config else []
+
+                    error_details = (
+                        f"Could not write PDF to requested location.\n"
+                        f"Requested: {final_path}\n"
+                        f"Error: {error_msg}\n\n"
+                        f"Allowed write directories (enforced by OS sandbox):\n" +
+                        "\n".join(f"  - {d}" for d in allowed_dirs) +
+                        "\n\nFor security reasons, PDFs can only be written to:\n"
+                        "  1. Current working directory (where server started)\n"
+                        "  2. System temp directory\n"
+                        "  3. Custom directories via TYPST_MCP_ALLOW_WRITE environment variable\n"
+                        "  4. Use output_mode='embedded' to get PDF data directly (no restrictions)"
+                    )
+
+                    await ctx.error(f"PDF write failed: {error_msg}")
+                    raise ToolError(error_details) from e
+
+            else:
+                # Generate automatic filename in temp directory (always allowed)
+                output_dir = get_pdf_output_dir()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
+                final_path = output_dir / unique_name
+
+                # Copy using sandboxed copy (async)
+                try:
+                    await anyio.to_thread.run_sync(
+                        partial(
+                            sandbox.secure_copy_file,
+                            str(pdf_file),
+                            str(final_path),
+                            timeout=10,
+                        )
+                    )
+                except Exception as e:
+                    await ctx.error(f"Failed to copy PDF: {e}")
+                    raise ToolError(f"Failed to copy PDF to temp directory: {e}") from e
+
+            await ctx.info(f"PDF saved to: {final_path}")
+
+            if typst_settings.enable_progress_reporting:
+                await ctx.report_progress(100, 100, "Complete")
+
+            return str(final_path)
+
+        else:  # embedded mode (default)
+            # Return File object - FastMCP automatically converts to EmbeddedResource
+            await ctx.info(f"Returning embedded PDF ({len(pdf_bytes)} bytes)")
+
+            if typst_settings.enable_progress_reporting:
+                await ctx.report_progress(100, 100, "Complete")
+
+            return File(
+                data=pdf_bytes,
+                format="pdf",
+                name="document.pdf",
             )
 
-            # Read PDF bytes (async)
-            pdf_bytes = await anyio.Path(pdf_file).read_bytes()
-
-            await ctx.debug(f"Generated PDF ({len(pdf_bytes)} bytes)")
-
-            # Progress reporting
-            if typst_settings.enable_progress_reporting:
-                await ctx.report_progress(80, 100, "PDF generated, preparing output")
-
-            # Return based on output mode
-            if output_mode == "path":
-                # Determine output path
-                if output_path:
-                    # Use custom filepath (must be absolute)
-                    final_path = Path(output_path).absolute()
-
-                    # SECURITY: Use sandboxed copy instead of Python file I/O
-                    # This ensures sandbox restrictions are enforced by the OS, not our code
-                    # Avoids vulnerabilities: symlinks, path traversal, race conditions, etc.
-
-                    try:
-                        # Use secure_copy_file (cross-platform, sandbox-enforced, async)
-                        await anyio.to_thread.run_sync(
-                            partial(
-                                sandbox.secure_copy_file,
-                                str(pdf_file),
-                                str(final_path),
-                                timeout=10,
-                            )
-                        )
-
-                        # SECURITY: Restrict file permissions to owner-only (0600)
-                        try:
-                            await anyio.to_thread.run_sync(os.chmod, final_path, 0o600)
-                        except Exception as chmod_err:
-                            eprint(f"Warning: Could not restrict PDF permissions: {chmod_err}")
-
-                    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
-                        # Sandbox blocked the operation or copy failed
-                        if isinstance(e, subprocess.CalledProcessError):
-                            error_msg = e.stderr.strip() if e.stderr else "Permission denied or path not allowed"
-                        else:
-                            error_msg = str(e)
-
-                        # Get allowed directories for helpful error message
-                        sb = sandbox.get_sandbox()
-                        allowed_dirs = sb.config.allow_write if sb and sb.config else []
-
-                        error_details = (
-                            f"Could not write PDF to requested location.\n"
-                            f"Requested: {final_path}\n"
-                            f"Error: {error_msg}\n\n"
-                            f"Allowed write directories (enforced by OS sandbox):\n" +
-                            "\n".join(f"  - {d}" for d in allowed_dirs) +
-                            "\n\nFor security reasons, PDFs can only be written to:\n"
-                            "  1. Current working directory (where server started)\n"
-                            "  2. System temp directory\n"
-                            "  3. Custom directories via TYPST_MCP_ALLOW_WRITE environment variable\n"
-                            "  4. Use output_mode='embedded' to get PDF data directly (no restrictions)"
-                        )
-
-                        await ctx.error(f"PDF write failed: {error_msg}")
-                        raise ToolError(error_details) from e
-
-                else:
-                    # Generate automatic filename in temp directory (always allowed)
-                    output_dir = get_pdf_output_dir()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    unique_name = f"document_{timestamp}_{os.urandom(3).hex()}.pdf"
-                    final_path = output_dir / unique_name
-
-                    # Copy using sandboxed copy (async)
-                    try:
-                        await anyio.to_thread.run_sync(
-                            partial(
-                                sandbox.secure_copy_file,
-                                str(pdf_file),
-                                str(final_path),
-                                timeout=10,
-                            )
-                        )
-                    except Exception as e:
-                        await ctx.error(f"Failed to copy PDF: {e}")
-                        raise ToolError(f"Failed to copy PDF to temp directory: {e}") from e
-
-                await ctx.info(f"PDF saved to: {final_path}")
-
-                if typst_settings.enable_progress_reporting:
-                    await ctx.report_progress(100, 100, "Complete")
-
-                return str(final_path)
-
-            else:  # embedded mode (default)
-                # Return File object - FastMCP automatically converts to EmbeddedResource
-                await ctx.info(f"Returning embedded PDF ({len(pdf_bytes)} bytes)")
-
-                if typst_settings.enable_progress_reporting:
-                    await ctx.report_progress(100, 100, "Complete")
-
-                return File(
-                    data=pdf_bytes,
-                    format="pdf",
-                    name="document.pdf",
-                )
-
-        except subprocess.CalledProcessError as e:
-            _telemetry["errors"]["typst_snippet_to_pdf"] += 1
-            error_message = e.stderr.strip() if e.stderr else "Unknown error"
-            await ctx.error(f"Typst compilation failed: {error_message}")
-            raise ToolError(
-                f"Failed to compile Typst to PDF: {error_message}",
-                code=-32001,
-                details={"snippet_length": len(typst_snippet), "stderr": error_message},
-            ) from e
-        finally:
-            # Cleanup temp files (async)
-            for temp_file in [typ_file, pdf_file]:
-                try:
-                    if await anyio.Path(temp_file).exists():
-                        await anyio.Path(temp_file).unlink()
-                except Exception:
-                    pass  # Ignore cleanup errors
+    except subprocess.CalledProcessError as e:
+        _telemetry["errors"]["typst_snippet_to_pdf"] += 1
+        error_message = e.stderr.strip() if e.stderr else "Unknown error"
+        await ctx.error(f"Typst compilation failed: {error_message}")
+        raise ToolError(
+            f"Failed to compile Typst to PDF: {error_message}",
+            code=MCPErrorCodes.OPERATION_FAILED,
+            details={"snippet_length": len(typst_snippet), "stderr": error_message},
+        ) from e
+    finally:
+        # Cleanup temp files (async)
+        for temp_file in [typ_file, pdf_file]:
+            try:
+                if await anyio.Path(temp_file).exists():
+                    await anyio.Path(temp_file).unlink()
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
 # ============================================================================
@@ -1232,7 +1216,7 @@ async def server_stats(ctx: Context) -> dict:
 # ============================================================================
 
 
-@mcp.resource("typst://v1/")
+@mcp.resource("typst://v1/", mime_type="application/json")
 async def root_index_resource(ctx: Context) -> str:
     """Root index of all available resource namespaces.
 
@@ -1261,7 +1245,7 @@ async def root_index_resource(ctx: Context) -> str:
     }, indent=2)
 
 
-@mcp.resource("typst://v1/docs/")
+@mcp.resource("typst://v1/docs/", mime_type="application/json")
 async def docs_namespace_index(ctx: Context) -> str:
     """Documentation namespace index."""
     _telemetry["resource_accesses"]["docs_namespace"] += 1
@@ -1284,7 +1268,7 @@ async def docs_namespace_index(ctx: Context) -> str:
     }, indent=2)
 
 
-@mcp.resource("typst://v1/packages/")
+@mcp.resource("typst://v1/packages/", mime_type="application/json")
 async def packages_namespace_index(ctx: Context) -> str:
     """Packages namespace index."""
     _telemetry["resource_accesses"]["packages_namespace"] += 1
@@ -1332,7 +1316,7 @@ async def packages_namespace_index(ctx: Context) -> str:
     }, indent=2)
 
 
-@mcp.resource("typst://v1/docs/chapters")
+@mcp.resource("typst://v1/docs/chapters", mime_type="application/json")
 async def list_docs_chapters_resource(ctx: Context) -> str:
     """Lists all chapters in the Typst documentation.
 
@@ -1361,7 +1345,7 @@ async def list_docs_chapters_resource(ctx: Context) -> str:
     return json.dumps(chapters, indent=2)
 
 
-@mcp.resource("typst://v1/docs/chapters/{route}")
+@mcp.resource("typst://v1/docs/chapters/{route}", mime_type="application/json")
 async def get_docs_chapter_resource(route: str, ctx: Context) -> str:
     """Gets a specific chapter from the Typst documentation by route.
 
@@ -1387,7 +1371,7 @@ async def get_docs_chapter_resource(route: str, ctx: Context) -> str:
 # ============================================================================
 
 
-@mcp.resource("typst://v1/packages/cached")
+@mcp.resource("typst://v1/packages/cached", mime_type="application/json")
 async def list_cached_package_resources(ctx: Context) -> str:
     """List all locally cached package documentation.
 
@@ -1419,7 +1403,7 @@ async def list_cached_package_resources(ctx: Context) -> str:
         raise ResourceError(f"Failed to list cached packages: {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}")
+@mcp.resource("typst://v1/packages/{package_name}/{version}", mime_type="application/json")
 async def get_cached_package_resource(package_name: str, version: str, ctx: Context) -> str:
     """Get package documentation (auto-fetches if not cached).
 
@@ -1493,7 +1477,7 @@ async def get_cached_package_resource(package_name: str, version: str, ctx: Cont
         raise ResourceError(f"Failed to fetch package '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}/readme")
+@mcp.resource("typst://v1/packages/{package_name}/{version}/readme", mime_type="application/json")
 async def get_package_readme_resource(package_name: str, version: str, ctx: Context) -> str:
     """Get full README content (auto-fetches if not cached).
 
@@ -1540,7 +1524,7 @@ async def get_package_readme_resource(package_name: str, version: str, ctx: Cont
         raise ResourceError(f"Failed to fetch README for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}/examples")
+@mcp.resource("typst://v1/packages/{package_name}/{version}/examples", mime_type="application/json")
 async def list_package_examples_resource(package_name: str, version: str, ctx: Context) -> str:
     """List all example files (auto-fetches if not cached).
 
@@ -1604,7 +1588,7 @@ async def list_package_examples_resource(package_name: str, version: str, ctx: C
         raise ResourceError(f"Failed to list examples for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}/examples/{filename}")
+@mcp.resource("typst://v1/packages/{package_name}/{version}/examples/{filename}", mime_type="application/json")
 async def get_package_example_resource(package_name: str, version: str, filename: str, ctx: Context) -> str:
     """Get specific example file content (auto-fetches if not cached).
 
@@ -1660,7 +1644,7 @@ async def get_package_example_resource(package_name: str, version: str, filename
         raise ResourceError(f"Failed to fetch example file '{filename}' from '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}/docs")
+@mcp.resource("typst://v1/packages/{package_name}/{version}/docs", mime_type="application/json")
 async def list_package_docs_resource(package_name: str, version: str, ctx: Context) -> str:
     """List all documentation files (auto-fetches if not cached).
 
@@ -1724,7 +1708,7 @@ async def list_package_docs_resource(package_name: str, version: str, ctx: Conte
         raise ResourceError(f"Failed to list docs for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://v1/packages/{package_name}/{version}/docs/{filename}")
+@mcp.resource("typst://v1/packages/{package_name}/{version}/docs/{filename}", mime_type="application/json")
 async def get_package_doc_file_resource(
     package_name: str, version: str, filename: str, ctx: Context
 ) -> str:
@@ -1810,7 +1794,7 @@ async def search_packages(query: str, ctx: Context, max_results: int = 20) -> li
     # Input validation
     if len(query) > MAX_QUERY_LENGTH:
         await ctx.error(f"Query too long: {len(query)} chars")
-        raise ToolError(f"Query too long: {len(query)} chars (max {MAX_QUERY_LENGTH} chars)", code=-32003)
+        raise ToolError(f"Query too long: {len(query)} chars (max {MAX_QUERY_LENGTH} chars)", code=MCPErrorCodes.TIMEOUT)
 
     if max_results < 1 or max_results > MAX_RESULTS:
         await ctx.warning(f"max_results out of range, clamping to 1-{MAX_RESULTS}")
@@ -1830,7 +1814,7 @@ async def search_packages(query: str, ctx: Context, max_results: int = 20) -> li
     except Exception as e:
         _telemetry["errors"]["search_packages"] += 1
         await ctx.error(f"Package search failed: {e}")
-        raise ToolError(f"Failed to search packages: {e}", code=-32001) from e
+        raise ToolError(f"Failed to search packages: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
 
 
 @mcp.tool()
@@ -1898,7 +1882,7 @@ async def list_packages(ctx: Context, offset: int = 0, limit: int = 100) -> dict
     except Exception as e:
         _telemetry["errors"]["list_packages"] += 1
         await ctx.error(f"Failed to list packages: {e}")
-        raise ToolError(f"Failed to list packages: {e}", code=-32001) from e
+        raise ToolError(f"Failed to list packages: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
 
 
 @mcp.tool()
@@ -1934,11 +1918,11 @@ async def get_package_versions(package_name: str, ctx: Context) -> list[str]:
     except RuntimeError as e:
         _telemetry["errors"]["get_package_versions"] += 1
         await ctx.error(f"Failed to get versions: {e}")
-        raise ToolError(f"Failed to get package versions: {e}", code=-32001) from e
+        raise ToolError(f"Failed to get package versions: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
     except Exception as e:
         _telemetry["errors"]["get_package_versions"] += 1
         await ctx.error(f"Unexpected error: {e}")
-        raise ToolError(f"Unexpected error while fetching versions: {e}", code=-32001) from e
+        raise ToolError(f"Unexpected error while fetching versions: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
 
 
 @mcp.tool()
@@ -2030,13 +2014,13 @@ async def get_package_docs(
     except RuntimeError as e:
         _telemetry["errors"]["get_package_docs"] += 1
         await ctx.error(f"Failed to fetch docs: {e}")
-        raise ToolError(f"Failed to fetch package docs: {e}", code=-32001) from e
+        raise ToolError(f"Failed to fetch package docs: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
     except Exception as e:
         _telemetry["errors"]["get_package_docs"] += 1
         await ctx.error(f"Unexpected error: {e}")
         raise ToolError(
             f"Unexpected error while fetching package documentation: {e}",
-            code=-32001,
+            code=MCPErrorCodes.OPERATION_FAILED,
         ) from e
 
 
@@ -2079,7 +2063,7 @@ async def get_package_file(package_name: str, version: str, file_path: str, ctx:
             raise ToolError(
                 f"File '{file_path}' not found in package '{package_name}@{version}'. "
                 f"Use get_package_docs(summary=True) to see available files.",
-                code=-32001,
+                code=MCPErrorCodes.OPERATION_FAILED,
             )
 
         await ctx.info(f"Fetched file ({len(content)} bytes)")
@@ -2097,7 +2081,7 @@ async def get_package_file(package_name: str, version: str, file_path: str, ctx:
     except Exception as e:
         _telemetry["errors"]["get_package_file"] += 1
         await ctx.error(f"Failed to fetch file: {e}")
-        raise ToolError(f"Failed to fetch package file: {e}", code=-32001) from e
+        raise ToolError(f"Failed to fetch package file: {e}", code=MCPErrorCodes.OPERATION_FAILED) from e
 
 
 @mcp.prompt()

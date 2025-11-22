@@ -588,7 +588,7 @@ def list_cached_packages() -> list[Dict[str, str]]:
                     "package": package,
                     "version": version,
                     "cache_file": str(cache_file),
-                    "uri": f"typst://package/{package}/{version}",
+                    "uri": f"typst://v1/packages/{package}/{version}",
                 })
 
     return cached

@@ -5,6 +5,37 @@ from pydantic import BaseModel, Field, field_validator
 import re
 
 # ============================================================================
+# MCP ERROR CODES
+# ============================================================================
+
+
+class MCPErrorCodes:
+    """Standard MCP/JSON-RPC 2.0 error codes.
+
+    Standard JSON-RPC 2.0 error codes:
+    - -32700: Parse error
+    - -32600: Invalid Request
+    - -32601: Method not found
+    - -32602: Invalid params
+    - -32603: Internal error
+
+    Application-specific codes (must be >= -32099 or custom range):
+    """
+    # Standard JSON-RPC 2.0 codes
+    PARSE_ERROR = -32700
+    INVALID_REQUEST = -32600
+    METHOD_NOT_FOUND = -32601
+    INVALID_PARAMS = -32602
+    INTERNAL_ERROR = -32603
+
+    # Application-specific codes (>= -32000)
+    INPUT_TOO_LARGE = -32000
+    OPERATION_FAILED = -32001
+    RESOURCE_NOT_FOUND = -32002
+    TIMEOUT = -32003
+
+
+# ============================================================================
 # VALIDATION CONSTANTS
 # ============================================================================
 
