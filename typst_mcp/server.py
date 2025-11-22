@@ -1,16 +1,17 @@
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Literal
 import base64
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 import anyio
@@ -32,6 +33,9 @@ from .models import (
     PackageSearchResult,
     ValidationResult,
     ConversionResult,
+    MAX_SNIPPET_LENGTH,
+    MAX_LATEX_SNIPPET_LENGTH,
+    MAX_QUERY_LENGTH,
 )
 
 # Use configured temp directory
@@ -40,7 +44,12 @@ temp_dir = str(typst_settings.temp_dir)
 # Create logger instance
 logger = get_logger("typst-mcp")
 
+# Server version and metadata
+__version__ = "0.2.0"
+_server_start_time = time.time()
+
 # Create FastMCP server instance
+# Note: FastMCP only accepts name parameter in current version
 mcp = FastMCP("Typst MCP Server")
 
 # Global state for lazy-loaded docs
@@ -51,6 +60,19 @@ _docs_state = {
     "docs": None,
     "lock": anyio.Lock(),
 }
+
+# Privacy-preserving telemetry (no user data)
+_telemetry = {
+    "tool_calls": Counter(),
+    "resource_accesses": Counter(),
+    "errors": Counter(),
+}
+
+# Package cache (for resource handlers)
+_package_cache: dict[str, dict] = {}
+
+# Maximum results for list/search operations
+MAX_RESULTS = 1000
 
 
 def eprint(*args, **kwargs):
@@ -345,42 +367,53 @@ async def list_docs_chapters(ctx: Context) -> str:
 
 
 @mcp.tool()
-def get_docs_chapter(route: str) -> str:
-    """
-    Gets a chapter by route.
-    The route is the path to the chapter in the typst docs.
-    For example, the route "____reference____layout____colbreak" corresponds to the chapter "reference/layout/colbreak".
-    The route is a string with underscores ("____") instead of slashes (because MCP uses slashes to separate the input parameters).
+async def get_docs_chapter(route: str, ctx: Context) -> str:
+    """Gets a chapter by route.
 
-    If a chapter has children and its content length is over 1000, this will only return the child routes
-    instead of the full content to avoid overwhelming responses.
+    The route is the path to the chapter in the typst docs.
+    For example, the route "____reference____layout____colbreak" corresponds to
+    the chapter "reference/layout/colbreak".
+    The route uses underscores ("____") as path separators.
+
+    If a chapter has children and its content length is over 1000, this will only
+    return the child routes instead of the full content to avoid overwhelming responses.
+
+    Args:
+        route: Chapter route with ____ as path separator
+        ctx: MCP context for logging
+
+    Returns:
+        JSON string containing chapter content or child routes
+
+    Raises:
+        ResourceError: If documentation is not available or chapter not found
     """
-    eprint(f"mcp.tool('get_docs_chapter') called with route: {route}")
+    _telemetry["tool_calls"]["get_docs_chapter"] += 1
+    await ctx.debug(f"Fetching chapter: {route}")
 
     try:
-        typst_docs = get_docs(wait_seconds=10)
-    except RuntimeError as e:
-        return json.dumps({"error": str(e)})
+        typst_docs = await get_docs(wait_seconds=10)
+    except ResourceError as e:
+        _telemetry["errors"]["get_docs_chapter"] += 1
+        await ctx.error(f"Documentation not available: {e}")
+        raise
 
-    # the rout could also be in the form of "____reference____layout____colbreak" -> "/reference/layout/colbreak"
-    # replace all underscores with slashes
+    # Convert underscores to slashes
     route = route.replace("____", "/")
 
     def route_matches(chapter_route: str, input_route: str) -> bool:
         return chapter_route.strip("/") == input_route.strip("/")
 
     def get_child(chapter: dict, route: str) -> dict:
-        """
-        Gets a child chapter by route.
-        """
+        """Gets a child chapter by route."""
         if "children" not in chapter:
             return {}
         for child in chapter["children"]:
             if route_matches(child["route"], route):
                 return child
-            child = get_child(child, route)
-            if child:
-                return child
+            child_result = get_child(child, route)
+            if child_result:
+                return child_result
         return {}
 
     # Find the requested chapter
@@ -395,10 +428,13 @@ def get_docs_chapter(route: str) -> str:
             break
 
     if not found_chapter:
-        return json.dumps({})
+        await ctx.warning(f"Chapter not found: {route}")
+        raise ResourceError(f"Chapter not found: {route}")
 
     # Check if chapter has children and is large
     content_length = len(json.dumps(found_chapter))
+    await ctx.debug(f"Chapter size: {content_length} bytes")
+
     if (
         "children" in found_chapter
         and len(found_chapter["children"]) > 0
@@ -412,6 +448,8 @@ def get_docs_chapter(route: str) -> str:
                     {"route": child["route"], "content_length": len(json.dumps(child))}
                 )
 
+        await ctx.info(f"Large chapter with {len(child_routes)} children, returning routes only")
+
         # Create simplified chapter with only essential info and child routes
         simplified_chapter = {
             "route": found_chapter["route"],
@@ -422,22 +460,40 @@ def get_docs_chapter(route: str) -> str:
         }
         return json.dumps(simplified_chapter)
 
+    await ctx.info(f"Returning chapter content ({content_length} bytes)")
     return json.dumps(found_chapter)
 
 
 @mcp.tool()
-def get_docs_chapters(routes: list) -> str:
-    """
-    Gets multiple chapters by their routes.
+async def get_docs_chapters(routes: list[str], ctx: Context) -> str:
+    """Gets multiple chapters by their routes.
+
     Takes a list of routes and returns a JSON stringified list of results.
 
+    Args:
+        routes: List of chapter routes
+        ctx: MCP context for logging
+
+    Returns:
+        JSON string containing list of chapter contents
+
     Example:
-    Input: ["____reference____layout____colbreak", "____reference____text____text"]
-    Output: JSON stringified list containing the content of both chapters
+        Input: ["____reference____layout____colbreak", "____reference____text____text"]
+        Output: JSON stringified list containing the content of both chapters
     """
+    _telemetry["tool_calls"]["get_docs_chapters"] += 1
+    await ctx.debug(f"Fetching {len(routes)} chapters")
+
     results = []
     for route in routes:
-        results.append(json.loads(get_docs_chapter(route)))
+        try:
+            chapter_json = await get_docs_chapter(route, ctx)
+            results.append(json.loads(chapter_json))
+        except ResourceError as e:
+            await ctx.warning(f"Failed to fetch chapter {route}: {e}")
+            results.append({"error": str(e), "route": route})
+
+    await ctx.info(f"Successfully fetched {len(results)} chapters")
     return json.dumps(results)
 
 
@@ -449,14 +505,14 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
     writing in LaTeX and converting to Typst automatically.
 
     Args:
-        latex_snippet: LaTeX code to convert
+        latex_snippet: LaTeX code to convert (max 50KB)
         ctx: MCP context for logging and progress reporting
 
     Returns:
         Converted Typst code (stripped of leading/trailing whitespace)
 
     Raises:
-        ToolError: If conversion fails due to invalid LaTeX or Pandoc error
+        ToolError: If conversion fails due to invalid LaTeX, Pandoc error, or input too large
 
     Examples:
         Math expression:
@@ -484,6 +540,17 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
         <fig:placeholder>
         ```
     """
+    _telemetry["tool_calls"]["latex_snippet_to_typst"] += 1
+
+    # Input validation
+    if len(latex_snippet) > MAX_LATEX_SNIPPET_LENGTH:
+        _telemetry["errors"]["latex_snippet_to_typst"] += 1
+        await ctx.error(f"LaTeX snippet too large: {len(latex_snippet)} bytes")
+        raise ToolError(
+            f"LaTeX snippet too large: {len(latex_snippet)} bytes (max {MAX_LATEX_SNIPPET_LENGTH} bytes)",
+            code=-32003,
+        )
+
     await ctx.debug(f"Converting LaTeX snippet ({len(latex_snippet)} chars)")
 
     # Write LaTeX to temp file (async)
@@ -513,11 +580,13 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
             )
         )
     except subprocess.CalledProcessError as e:
+        _telemetry["errors"]["latex_snippet_to_typst"] += 1
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
         await ctx.error(f"Pandoc conversion failed: {error_message}")
         raise ToolError(
             f"Failed to convert LaTeX to Typst. Pandoc error: {error_message}",
-            details={"snippet_length": len(latex_snippet)},
+            code=-32001,
+            details={"snippet_length": len(latex_snippet), "stderr": error_message},
         ) from e
 
     # Read converted Typst code (async)
@@ -529,179 +598,221 @@ async def latex_snippet_to_typst(latex_snippet: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-def latex_snippets_to_typst(latex_snippets: list) -> str:
-    r"""
-    Converts multiple latex snippets to typst.
+async def latex_snippets_to_typst(latex_snippets: list[str], ctx: Context) -> str:
+    r"""Converts multiple LaTeX snippets to Typst.
+
     Takes a list of LaTeX snippets and returns a JSON stringified list of results.
 
-    Example:
-    Input: ["$f\in K ( t^ { H } , \beta ) _ { \delta }$", "\\begin{align} a &= b \\\\ c &= d \\end{align}"]
-    Output: JSON stringified list containing the converted typst for each snippet
-    """
-    results = []
-    # Ensure latex_snippets is actually a list
-    if not isinstance(latex_snippets, list):
-        try:
-            latex_snippets = json.loads(latex_snippets)
-        except:
-            pass
+    Args:
+        latex_snippets: List of LaTeX code strings
+        ctx: MCP context for logging
 
-    for snippet in latex_snippets:
-        results.append(latex_snippet_to_typst(snippet))
+    Returns:
+        JSON string containing list of converted Typst code
+
+    Example:
+        Input: ["$f\in K ( t^ { H } , \beta ) _ { \delta }$", "\\begin{align} a &= b \\\\ c &= d \\end{align}"]
+        Output: JSON stringified list containing the converted typst for each snippet
+    """
+    _telemetry["tool_calls"]["latex_snippets_to_typst"] += 1
+    await ctx.debug(f"Converting {len(latex_snippets)} LaTeX snippets")
+
+    results = []
+    for i, snippet in enumerate(latex_snippets):
+        try:
+            converted = await latex_snippet_to_typst(snippet, ctx)
+            results.append(converted)
+        except ToolError as e:
+            await ctx.warning(f"Failed to convert snippet {i+1}: {e}")
+            results.append(f"ERROR: {e}")
+
+    await ctx.info(f"Converted {len(results)} snippets")
     return json.dumps(results)
 
 
 @mcp.tool()
-def check_if_snippet_is_valid_typst_syntax(typst_snippet) -> str:
-    r"""
-    Checks if the given typst text is valid typst syntax.
-    Returns "VALID" if it is valid, otherwise returns "INVALID! Error message: {error_message}".
+async def check_if_snippet_is_valid_typst_syntax(typst_snippet: str, ctx: Context) -> str:
+    r"""Checks if the given Typst text has valid syntax.
+
+    Returns "VALID" if valid, otherwise returns "INVALID! Error message: {error_message}".
 
     The LLM should use this to check if the typst syntax it generated is valid.
     If not valid, the LLM should try to fix it and check again.
-    This should be used primarily for checking small snippets of typst syntax but it can also be used for larger snippets.
+
+    Args:
+        typst_snippet: Typst code to validate (max 100KB)
+        ctx: MCP context for logging
+
+    Returns:
+        "VALID" if syntax is valid, or "INVALID! Error message: ..." with details
 
     Example 1:
-    ```typst
-    "$f in K \( t^H \, beta \)_delta$"
-    ```
-    returns: VALID
+        Input: "$f in K \( t^H \, beta \)_delta$"
+        Output: "VALID"
 
     Example 2:
-    ```typst
-    $a = \frac{1}{2}$ // not valid typst syntax (\frac is a latex command and not a typst command)
-    ```
-    returns: INVALID! Error message: {error: unknown variable: rac
-        ┌─ temp.typ:1:7
-        │
-        1 │ $a = \frac{1}{2}$
-        │        ^^^
-        │
-        = hint: if you meant to display multiple letters as is, try adding spaces between each letter: `r a c`
-        = hint: or if you meant to display this as text, try placing it in quotes: `"rac"`}
-
+        Input: "$a = \frac{1}{2}$"
+        Output: "INVALID! Error message: {error: unknown variable: rac ...}"
     """
+    _telemetry["tool_calls"]["check_if_snippet_is_valid_typst_syntax"] += 1
 
-    # create a main.typ file with the typst
-    with open(os.path.join(temp_dir, "main.typ"), "w") as f:
-        f.write(typst_snippet)
-    # run the typst command line tool and capture the result
+    # Input validation
+    if len(typst_snippet) > MAX_SNIPPET_LENGTH:
+        await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
+        return f"INVALID! Error message: Snippet too large ({len(typst_snippet)} bytes, max {MAX_SNIPPET_LENGTH} bytes)"
+
+    await ctx.debug(f"Validating Typst snippet ({len(typst_snippet)} chars)")
+
+    # Write to temp file (async)
+    typ_file = anyio.Path(temp_dir) / "main.typ"
+    await typ_file.write_text(typst_snippet, encoding="utf-8")
+
+    # Run validation in thread pool
     try:
-        sandbox.run_sandboxed(
-            ["typst", "compile", os.path.join(temp_dir, "main.typ")],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,  # SECURITY: Prevent DoS from malicious code
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                ["typst", "compile", str(typ_file)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,  # SECURITY: Prevent DoS from malicious code
+            )
         )
+        await ctx.info("Syntax validation: VALID")
         return "VALID"
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown error"
+        await ctx.debug(f"Syntax validation failed: {error_message[:100]}...")
         return f"INVALID! Error message: {error_message}"
 
 
 @mcp.tool()
-def check_if_snippets_are_valid_typst_syntax(typst_snippets: list) -> str:
-    r"""
-    Checks if multiple typst snippets have valid syntax.
+async def check_if_snippets_are_valid_typst_syntax(typst_snippets: list[str], ctx: Context) -> str:
+    r"""Checks if multiple Typst snippets have valid syntax.
+
     Takes a list of typst snippets and returns a JSON stringified list of results.
 
-    The LLM should use this for example to check every single typst snippet it generated.
+    Args:
+        typst_snippets: List of Typst code strings to validate
+        ctx: MCP context for logging
+
+    Returns:
+        JSON string containing list of validation results ("VALID" or error messages)
 
     Example:
-    Input: ["$f in K \( t^H \, beta \)_delta$", "#let x = 1\n#x"]
-    Output: JSON stringified list containing validation results ("VALID" or error messages)
+        Input: ["$f in K \( t^H \, beta \)_delta$", "#let x = 1\n#x"]
+        Output: JSON list containing validation results
     """
-    results = []
-    # Ensure typst_snippets is actually a list
-    if not isinstance(typst_snippets, list):
-        try:
-            typst_snippets = json.loads(typst_snippets)
-        except:
-            pass
+    _telemetry["tool_calls"]["check_if_snippets_are_valid_typst_syntax"] += 1
+    await ctx.debug(f"Validating {len(typst_snippets)} Typst snippets")
 
-    for snippet in typst_snippets:
-        results.append(check_if_snippet_is_valid_typst_syntax(snippet))
+    results = []
+    for i, snippet in enumerate(typst_snippets):
+        result = await check_if_snippet_is_valid_typst_syntax(snippet, ctx)
+        results.append(result)
+
+    valid_count = sum(1 for r in results if r == "VALID")
+    await ctx.info(f"Validated {len(results)} snippets: {valid_count} valid, {len(results) - valid_count} invalid")
     return json.dumps(results)
 
 
 @mcp.tool()
-def typst_snippet_to_image(typst_snippet) -> Image | str:
-    r"""
-    Converts a typst text to an image using the typst command line tool.
-    It is capable of converting multiple pages to a single png image.
+async def typst_snippet_to_image(typst_snippet: str, ctx: Context) -> Image:
+    r"""Converts Typst code to an image using the typst command line tool.
+
+    It is capable of converting multiple pages to a single PNG image.
     The image gets cropped to the content and padded with 10px on each side.
 
-    The LLM should use this to convert typst to an image and then evaluate if the image is what it wanted.
-    If not valid, the LLM should try to fix it and check again.
-    This should be used primarily for converting small snippets of typst to images but it can also be used for larger snippets.
+    The LLM should use this to convert typst to an image and then evaluate if the image
+    is what it wanted. If not valid, the LLM should try to fix it and check again.
+
+    Args:
+        typst_snippet: Typst code to render (max 100KB)
+        ctx: MCP context for logging
+
+    Returns:
+        Image object containing PNG data
+
+    Raises:
+        ToolError: If rendering fails or no pages generated
 
     Example 1:
-    ```typst
-    "$f in K \( t^H \, beta \)_delta$"
-    ```
-    gets converted to:
-    ```image
-    <image object>
-    ```
+        Input: "$f in K \( t^H \, beta \)_delta$"
+        Output: Image object with rendered math
 
     Example 2:
-    ```typst
-    #figure(image("placeholder.png", width: 8cm),
-        caption: [
-            Placeholder image
-        ]
-    )
-    <fig:placeholder>
-    ```
-    gets converted to:
-    ```image
-    <image object>
-    ```
-
+        Input: "#figure(...)"
+        Output: Image object with rendered figure
     """
+    _telemetry["tool_calls"]["typst_snippet_to_image"] += 1
 
-    # create a main.typ file with the typst
-    with open(os.path.join(temp_dir, "main.typ"), "w") as f:
-        f.write(typst_snippet)
-
-    # run the typst command line tool and capture the result
-    try:
-        sandbox.run_sandboxed(
-            [
-                "typst",
-                "compile",
-                os.path.join(temp_dir, "main.typ"),
-                "--format",
-                "png",
-                "--ppi",
-                "500",
-                os.path.join(temp_dir, "page{0p}.png"),
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,  # SECURITY: Prevent DoS (longer for image generation)
+    # Input validation
+    if len(typst_snippet) > MAX_SNIPPET_LENGTH:
+        _telemetry["errors"]["typst_snippet_to_image"] += 1
+        await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
+        raise ToolError(
+            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
+            code=-32003,
         )
 
-        # Find all generated pages
-        page_files = []
-        page_num = 1
-        while os.path.exists(os.path.join(temp_dir, f"page{page_num}.png")):
-            page_files.append(os.path.join(temp_dir, f"page{page_num}.png"))
-            page_num += 1
+    await ctx.debug(f"Rendering Typst to image ({len(typst_snippet)} chars)")
 
-        if not page_files:
-            return "ERROR: in typst_to_image. No pages were generated."
+    # Write to temp file (async)
+    typ_file = anyio.Path(temp_dir) / "main.typ"
+    await typ_file.write_text(typst_snippet, encoding="utf-8")
 
-        # Load all pages using PIL and crop to content
+    # Run Typst compiler in thread pool
+    try:
+        await anyio.to_thread.run_sync(
+            lambda: sandbox.run_sandboxed(
+                [
+                    "typst",
+                    "compile",
+                    str(typ_file),
+                    "--format",
+                    "png",
+                    "--ppi",
+                    "500",
+                    os.path.join(temp_dir, "page{0p}.png"),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,  # SECURITY: Prevent DoS (longer for image generation)
+            )
+        )
+    except subprocess.CalledProcessError as e:
+        _telemetry["errors"]["typst_snippet_to_image"] += 1
+        error_message = e.stderr.strip() if e.stderr else "Unknown error"
+        await ctx.error(f"Typst compilation failed: {error_message[:100]}...")
+        raise ToolError(
+            f"Failed to convert Typst to image: {error_message}",
+            code=-32001,
+            details={"snippet_length": len(typst_snippet), "stderr": error_message},
+        ) from e
+
+    # Find all generated pages
+    page_files = []
+    page_num = 1
+    while os.path.exists(os.path.join(temp_dir, f"page{page_num}.png")):
+        page_files.append(os.path.join(temp_dir, f"page{page_num}.png"))
+        page_num += 1
+
+    if not page_files:
+        _telemetry["errors"]["typst_snippet_to_image"] += 1
+        await ctx.error("No pages generated")
+        raise ToolError("No pages were generated by Typst compiler")
+
+    await ctx.debug(f"Processing {len(page_files)} page(s)")
+
+    # Process images in thread pool (CPU-intensive)
+    def process_images():
+        """Process and combine page images (runs in thread pool)."""
         pages = []
         for page_file in page_files:
             img = PILImage.open(page_file)
-
-            # Convert to numpy array for easier processing
             img_array = np.array(img)
 
             # Check if the image is RGB
@@ -734,40 +845,44 @@ def typst_snippet_to_image(typst_snippet) -> Image | str:
                 pages.append(img)
 
         if not pages:
-            return "ERROR: in typst_to_image. Failed to process page images."
+            raise ValueError("Failed to process page images")
 
-        # Calculate total height
+        # Calculate total dimensions
         total_width = max(page.width for page in pages)
         total_height = sum(page.height for page in pages)
 
-        # Create a new image with the combined dimensions
-        combined_image = PILImage.new(
-            "RGB", (total_width, total_height), (255, 255, 255)
-        )
+        # Create combined image
+        combined_image = PILImage.new("RGB", (total_width, total_height), (255, 255, 255))
 
         # Paste all pages vertically
         y_offset = 0
         for page in pages:
-            # Center horizontally if page is narrower than the combined image
             x_offset = (total_width - page.width) // 2
             combined_image.paste(page, (x_offset, y_offset))
             y_offset += page.height
 
-        # Save combined image to bytes
+        # Save to bytes
         img_bytes_io = io.BytesIO()
         combined_image.save(img_bytes_io, format="PNG")
-        img_bytes = img_bytes_io.getvalue()
+        return img_bytes_io.getvalue()
 
-        # Clean up temp files
-        os.remove(os.path.join(temp_dir, "main.typ"))
-        for page_file in page_files:
-            os.remove(page_file)
+    try:
+        img_bytes = await anyio.to_thread.run_sync(process_images)
+    except Exception as e:
+        _telemetry["errors"]["typst_snippet_to_image"] += 1
+        await ctx.error(f"Image processing failed: {e}")
+        raise ToolError(f"Failed to process page images: {e}") from e
+    finally:
+        # Clean up temp files (async)
+        try:
+            await typ_file.unlink()
+            for page_file in page_files:
+                await anyio.Path(page_file).unlink()
+        except Exception:
+            pass  # Ignore cleanup errors
 
-        return Image(data=img_bytes, format="png")
-
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else "Unknown error"
-        return f"ERROR: in typst_to_image. Failed to convert typst to image. Error message from typst: {error_message}"
+    await ctx.info(f"Generated image ({len(img_bytes)} bytes, {len(page_files)} page(s))")
+    return Image(data=img_bytes, format="png")
 
 
 # NOTE: This tool is registered manually in main() with dynamic description
@@ -859,7 +974,22 @@ async def typst_snippet_to_pdf(
 
     {{SANDBOX_PATHS_PLACEHOLDER}}
     """
+    _telemetry["tool_calls"]["typst_snippet_to_pdf"] += 1
+
+    # Input validation
+    if len(typst_snippet) > MAX_SNIPPET_LENGTH:
+        _telemetry["errors"]["typst_snippet_to_pdf"] += 1
+        await ctx.error(f"Snippet too large: {len(typst_snippet)} bytes")
+        raise ToolError(
+            f"Typst snippet too large: {len(typst_snippet)} bytes (max {MAX_SNIPPET_LENGTH} bytes)",
+            code=-32003,
+        )
+
     await ctx.debug(f"Compiling Typst to PDF (mode: {output_mode}, {len(typst_snippet)} chars)")
+
+    # Progress reporting for large documents
+    if typst_settings.enable_progress_reporting:
+        await ctx.report_progress(0, 100, "Starting PDF compilation")
 
     # Create unique temporary directory
     async with anyio.create_task_group() as tg:
@@ -888,6 +1018,10 @@ async def typst_snippet_to_pdf(
             pdf_bytes = await anyio.Path(pdf_file).read_bytes()
 
             await ctx.debug(f"Generated PDF ({len(pdf_bytes)} bytes)")
+
+            # Progress reporting
+            if typst_settings.enable_progress_reporting:
+                await ctx.report_progress(80, 100, "PDF generated, preparing output")
 
             # Return based on output mode
             if output_mode == "path":
@@ -966,11 +1100,19 @@ async def typst_snippet_to_pdf(
                         raise ToolError(f"Failed to copy PDF to temp directory: {e}") from e
 
                 await ctx.info(f"PDF saved to: {final_path}")
+
+                if typst_settings.enable_progress_reporting:
+                    await ctx.report_progress(100, 100, "Complete")
+
                 return str(final_path)
 
             else:  # embedded mode (default)
                 # Return File object - FastMCP automatically converts to EmbeddedResource
                 await ctx.info(f"Returning embedded PDF ({len(pdf_bytes)} bytes)")
+
+                if typst_settings.enable_progress_reporting:
+                    await ctx.report_progress(100, 100, "Complete")
+
                 return File(
                     data=pdf_bytes,
                     format="pdf",
@@ -978,11 +1120,13 @@ async def typst_snippet_to_pdf(
                 )
 
         except subprocess.CalledProcessError as e:
+            _telemetry["errors"]["typst_snippet_to_pdf"] += 1
             error_message = e.stderr.strip() if e.stderr else "Unknown error"
             await ctx.error(f"Typst compilation failed: {error_message}")
             raise ToolError(
                 f"Failed to compile Typst to PDF: {error_message}",
-                details={"snippet_length": len(typst_snippet)},
+                code=-32001,
+                details={"snippet_length": len(typst_snippet), "stderr": error_message},
             ) from e
         finally:
             # Cleanup temp files (async)
@@ -995,52 +1139,216 @@ async def typst_snippet_to_pdf(
 
 
 # ============================================================================
+# SERVER HEALTH AND TELEMETRY TOOLS
+# ============================================================================
+
+
+@mcp.tool()
+async def server_health(ctx: Context) -> dict:
+    """Health check endpoint for monitoring.
+
+    Returns server health status, version, and operational state.
+
+    Args:
+        ctx: MCP context for logging
+
+    Returns:
+        Dictionary containing health status and server information
+    """
+    _telemetry["tool_calls"]["server_health"] += 1
+    await ctx.debug("Health check requested")
+
+    health = {
+        "status": "healthy",
+        "version": __version__,
+        "server_name": "Typst MCP Server",
+        "docs_status": {
+            "loaded": _docs_state["loaded"],
+            "building": _docs_state["building"],
+            "error": _docs_state["error"],
+        },
+        "sandbox_enabled": sandbox.get_sandbox().sandboxed if sandbox.get_sandbox() else False,
+        "uptime_seconds": round(time.time() - _server_start_time, 2),
+    }
+
+    await ctx.info(f"Health check: {health['status']}")
+    return health
+
+
+@mcp.tool()
+async def server_stats(ctx: Context) -> dict:
+    """Get server usage statistics (privacy-preserving).
+
+    Returns telemetry data about tool usage, errors, and performance.
+    No user data is collected - only aggregate counts.
+
+    Args:
+        ctx: MCP context for logging
+
+    Returns:
+        Dictionary containing usage statistics and performance metrics
+    """
+    _telemetry["tool_calls"]["server_stats"] += 1
+    await ctx.debug("Statistics requested")
+
+    uptime = time.time() - _server_start_time
+    total_tool_calls = sum(_telemetry["tool_calls"].values())
+    total_errors = sum(_telemetry["errors"].values())
+
+    stats = {
+        "uptime": {
+            "seconds": round(uptime, 2),
+            "hours": round(uptime / 3600, 2),
+            "human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m",
+        },
+        "tool_calls": {
+            "total": total_tool_calls,
+            "by_tool": dict(_telemetry["tool_calls"]),
+            "top_5": _telemetry["tool_calls"].most_common(5),
+        },
+        "errors": {
+            "total": total_errors,
+            "by_tool": dict(_telemetry["errors"]),
+        },
+        "resource_accesses": {
+            "total": sum(_telemetry["resource_accesses"].values()),
+            "by_resource": dict(_telemetry["resource_accesses"]),
+        },
+        "performance": {
+            "requests_per_hour": round((total_tool_calls / uptime) * 3600, 2) if uptime > 0 else 0,
+            "error_rate": round((total_errors / total_tool_calls) * 100, 2) if total_tool_calls > 0 else 0,
+        },
+        "cache": {
+            "cached_packages": len(_package_cache),
+        },
+    }
+
+    await ctx.info(f"Serving stats: {total_tool_calls} calls, {total_errors} errors, {uptime/3600:.1f}h uptime")
+    return stats
+
+
+# ============================================================================
 # CORE TYPST DOCUMENTATION RESOURCES
 # ============================================================================
 
 
-@mcp.resource("typst://docs/index")
-def docs_index_resource() -> str:
+@mcp.resource("typst://v1/")
+async def root_index_resource(ctx: Context) -> str:
+    """Root index of all available resource namespaces.
+
+    Provides discovery for all available resources in the Typst MCP server.
     """
-    Index of all available Typst documentation resources.
-    Useful for discovering what documentation is available.
-    """
-    return json.dumps(
-        {
-            "resources": [
-                {
-                    "uri": "typst://docs/chapters",
-                    "name": "Documentation Chapters List",
-                    "description": "Complete list of all documentation chapters with routes and sizes",
-                    "mimeType": "application/json",
-                },
-                {
-                    "uri": "typst://docs/chapter/{route}",
-                    "name": "Documentation Chapter",
-                    "description": "Individual chapter content by route (use ____ as path separator)",
-                    "mimeType": "application/json",
-                },
-            ],
-            "note": "If your client doesn't support resources, use the equivalent tools instead.",
-        },
-        indent=2,
-    )
+    _telemetry["resource_accesses"]["root_index"] += 1
+    await ctx.debug("Accessing root resource index")
+
+    return json.dumps({
+        "version": "v1",
+        "server": "Typst MCP Server",
+        "server_version": __version__,
+        "namespaces": [
+            {
+                "name": "docs",
+                "uri": "typst://v1/docs/",
+                "description": "Typst core documentation chapters"
+            },
+            {
+                "name": "packages",
+                "uri": "typst://v1/packages/",
+                "description": "Typst Universe package registry and documentation"
+            }
+        ],
+        "note": "Use namespace URIs to discover available resources"
+    }, indent=2)
 
 
-@mcp.resource("typst://docs/chapters")
-def list_docs_chapters_resource() -> str:
-    """
-    Lists all chapters in the Typst documentation.
+@mcp.resource("typst://v1/docs/")
+async def docs_namespace_index(ctx: Context) -> str:
+    """Documentation namespace index."""
+    _telemetry["resource_accesses"]["docs_namespace"] += 1
+    await ctx.debug("Accessing docs namespace index")
+
+    return json.dumps({
+        "namespace": "docs",
+        "resources": [
+            {
+                "uri": "typst://v1/docs/chapters",
+                "name": "All documentation chapters",
+                "description": "Complete list of available chapters with routes"
+            },
+            {
+                "uri": "typst://v1/docs/chapters/{route}",
+                "name": "Specific chapter by route",
+                "description": "Get chapter content using ____ as path separator"
+            }
+        ]
+    }, indent=2)
+
+
+@mcp.resource("typst://v1/packages/")
+async def packages_namespace_index(ctx: Context) -> str:
+    """Packages namespace index."""
+    _telemetry["resource_accesses"]["packages_namespace"] += 1
+    await ctx.debug("Accessing packages namespace index")
+
+    return json.dumps({
+        "namespace": "packages",
+        "resources": [
+            {
+                "uri": "typst://v1/packages/cached",
+                "name": "Cached packages",
+                "description": "List of all locally cached package docs"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}",
+                "name": "Package documentation",
+                "description": "Get package docs (auto-fetches if not cached)"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}/readme",
+                "name": "Package README",
+                "description": "Get full README content"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}/examples",
+                "name": "Package examples list",
+                "description": "List all example files"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}/examples/{filename}",
+                "name": "Package example file",
+                "description": "Get specific example file content"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}/docs",
+                "name": "Package docs list",
+                "description": "List all documentation files"
+            },
+            {
+                "uri": "typst://v1/packages/{name}/{version}/docs/{filename}",
+                "name": "Package doc file",
+                "description": "Get specific documentation file content"
+            }
+        ]
+    }, indent=2)
+
+
+@mcp.resource("typst://v1/docs/chapters")
+async def list_docs_chapters_resource(ctx: Context) -> str:
+    """Lists all chapters in the Typst documentation.
 
     Returns a JSON array of all available documentation chapters with their routes and content sizes.
 
     Lazy loading: First access may build docs (~1-2 min first time),
     subsequent accesses are instant (cached).
     """
+    _telemetry["resource_accesses"]["docs_chapters"] += 1
+    await ctx.debug("Accessing docs chapters resource")
+
     try:
-        typst_docs = get_docs(wait_seconds=10)
-    except RuntimeError as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        typst_docs = await get_docs(wait_seconds=10)
+    except ResourceError as e:
+        await ctx.error(f"Documentation not available: {e}")
+        raise  # Raise instead of returning JSON error
 
     chapters = []
     for chapter in typst_docs:
@@ -1048,13 +1356,14 @@ def list_docs_chapters_resource() -> str:
             {"route": chapter["route"], "content_length": len(json.dumps(chapter))}
         )
         chapters += list_child_routes(chapter)
+
+    await ctx.info(f"Returning {len(chapters)} chapters")
     return json.dumps(chapters, indent=2)
 
 
-@mcp.resource("typst://docs/chapter/{route}")
-def get_docs_chapter_resource(route: str) -> str:
-    """
-    Gets a specific chapter from the Typst documentation by route.
+@mcp.resource("typst://v1/docs/chapters/{route}")
+async def get_docs_chapter_resource(route: str, ctx: Context) -> str:
+    """Gets a specific chapter from the Typst documentation by route.
 
     The route uses underscores (____) as path separators instead of slashes.
 
@@ -1062,11 +1371,15 @@ def get_docs_chapter_resource(route: str) -> str:
     subsequent accesses are instant (cached).
 
     Example URIs:
-    - typst://docs/chapter/reference____layout____colbreak
-    - typst://docs/chapter/reference____text____text
+    - typst://v1/docs/chapters/reference____layout____colbreak
+    - typst://v1/docs/chapters/reference____text____text
     """
-    # Reuse the existing tool implementation
-    return get_docs_chapter(route)
+    _telemetry["resource_accesses"]["docs_chapter"] += 1
+    await ctx.debug(f"Accessing docs chapter resource: {route}")
+
+    # Call the async tool implementation
+    result = await get_docs_chapter(route, ctx)
+    return result
 
 
 # ============================================================================
@@ -1074,33 +1387,41 @@ def get_docs_chapter_resource(route: str) -> str:
 # ============================================================================
 
 
-@mcp.resource("typst://packages/cached")
-def list_cached_package_resources() -> str:
-    """
-    List all locally cached package documentation.
+@mcp.resource("typst://v1/packages/cached")
+async def list_cached_package_resources(ctx: Context) -> str:
+    """List all locally cached package documentation.
 
     Returns a JSON array of all packages that have been downloaded and cached.
     Each entry includes the package name, version, and URI for accessing the docs.
 
     This resource updates dynamically as packages are fetched via tools.
     """
-    from .package_docs import list_cached_packages
+    _telemetry["resource_accesses"]["packages_cached"] += 1
+    await ctx.debug("Accessing cached packages resource")
 
-    cached = list_cached_packages()
-    return json.dumps(
-        {
-            "cached_packages": cached,
-            "count": len(cached),
-            "note": "These packages are available as resources at typst://package/{name}/{version}",
-        },
-        indent=2,
-    )
+    try:
+        from .package_docs import list_cached_packages
+
+        # Run in thread pool (may do disk I/O)
+        cached = await anyio.to_thread.run_sync(list_cached_packages)
+
+        await ctx.info(f"Returning {len(cached)} cached packages")
+        return json.dumps(
+            {
+                "cached_packages": cached,
+                "count": len(cached),
+                "note": "These packages are available as resources at typst://v1/packages/{name}/{version}",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        await ctx.error(f"Failed to list cached packages: {e}")
+        raise ResourceError(f"Failed to list cached packages: {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}")
-def get_cached_package_resource(package_name: str, version: str) -> str:
-    """
-    Get package documentation (auto-fetches if not cached).
+@mcp.resource("typst://v1/packages/{package_name}/{version}")
+async def get_cached_package_resource(package_name: str, version: str, ctx: Context) -> str:
+    """Get package documentation (auto-fetches if not cached).
 
     Returns lightweight summary including:
     - Metadata and README preview
@@ -1113,349 +1434,351 @@ def get_cached_package_resource(package_name: str, version: str) -> str:
     For full content, use:
     - get_package_docs(package_name, version, summary=False) tool
     - get_package_file(package_name, version, file_path) tool
-
-    URI format: typst://package/{package_name}/{version}
-    Example: typst://package/cetz/0.4.2
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package"] += 1
+    await ctx.debug(f"Accessing package resource: {package_name}@{version}")
 
-    # Try cache first
-    docs = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached (WebDAV-like pattern)
-    if docs is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} (not cached)")
-        try:
-            docs = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"Failed to fetch package '{package_name}@{version}': {str(e)}",
-                    "package": package_name,
-                    "version": version,
-                },
-                indent=2,
+        # Try cache first
+        docs = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached (WebDAV-like pattern)
+        if docs is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} (not cached)")
+
+            # Run in thread pool (network I/O)
+            docs = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
             )
 
-    # Return summary by default (resources are for browsing)
-    summary = {
-        "package": docs["package"],
-        "version": docs["version"],
-        "metadata": docs["metadata"],
-        "readme_preview": docs["readme"][:500] + "..."
-        if docs.get("readme") and len(docs["readme"]) > 500
-        else docs.get("readme"),
-        "examples_count": len(docs.get("examples") or []),
-        "docs_count": len(docs.get("docs") or {}),
-        "examples_list": [
-            {
-                "filename": ex["filename"],
-                "size": ex["size"],
-                "path": f"examples/{ex['filename']}",
-            }
-            for ex in (docs.get("examples") or [])
-        ]
-        if docs.get("examples")
-        else [],
-        "docs_list": [
-            {"filename": name, "size": len(content), "path": f"docs/{name}"}
-            for name, content in (docs.get("docs") or {}).items()
-        ]
-        if docs.get("docs")
-        else [],
-        "import_statement": docs["import_statement"],
-        "universe_url": docs["universe_url"],
-        "homepage_url": docs.get("homepage_url"),
-        "note": "Use get_package_docs() or get_package_file() tools for full content",
-    }
+        # Return summary by default (resources are for browsing)
+        summary = {
+            "package": docs["package"],
+            "version": docs["version"],
+            "metadata": docs["metadata"],
+            "readme_preview": docs["readme"][:500] + "..."
+            if docs.get("readme") and len(docs["readme"]) > 500
+            else docs.get("readme"),
+            "examples_count": len(docs.get("examples") or []),
+            "docs_count": len(docs.get("docs") or {}),
+            "examples_list": [
+                {
+                    "filename": ex["filename"],
+                    "size": ex["size"],
+                    "path": f"examples/{ex['filename']}",
+                }
+                for ex in (docs.get("examples") or [])
+            ]
+            if docs.get("examples")
+            else [],
+            "docs_list": [
+                {"filename": name, "size": len(content), "path": f"docs/{name}"}
+                for name, content in (docs.get("docs") or {}).items()
+            ]
+            if docs.get("docs")
+            else [],
+            "import_statement": docs["import_statement"],
+            "universe_url": docs["universe_url"],
+            "homepage_url": docs.get("homepage_url"),
+            "note": "Use get_package_docs() or get_package_file() tools for full content",
+        }
 
-    return json.dumps(summary, indent=2)
+        await ctx.info(f"Returning package summary")
+        return json.dumps(summary, indent=2)
+
+    except Exception as e:
+        await ctx.error(f"Failed to fetch package: {e}")
+        raise ResourceError(f"Failed to fetch package '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}/readme")
-def get_package_readme_resource(package_name: str, version: str) -> str:
-    """
-    Get full README content (auto-fetches if not cached).
+@mcp.resource("typst://v1/packages/{package_name}/{version}/readme")
+async def get_package_readme_resource(package_name: str, version: str, ctx: Context) -> str:
+    """Get full README content (auto-fetches if not cached).
 
     Lazy loading: First access fetches package data (~3-5s),
     subsequent accesses are instant (cached).
-
-    URI format: typst://package/{package_name}/{version}/readme
-    Example: typst://package/cetz/0.4.2/readme
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package_readme"] += 1
+    await ctx.debug(f"Accessing README resource: {package_name}@{version}")
 
-    # Try cache first
-    docs = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached
-    if docs is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} for README")
-        try:
-            docs = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"Failed to fetch package: {str(e)}",
-                    "package": package_name,
-                    "version": version,
-                },
-                indent=2,
+        # Try cache first
+        docs = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached
+        if docs is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} for README")
+
+            # Run in thread pool (network I/O)
+            docs = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
             )
 
-    if not docs.get("readme"):
+        if not docs.get("readme"):
+            await ctx.warning(f"README not available for {package_name}@{version}")
+            raise ResourceError(f"README not available for {package_name}@{version}")
+
+        await ctx.info(f"Returning README ({len(docs['readme'])} bytes)")
         return json.dumps(
-            {"error": f"README not available for {package_name}@{version}"}, indent=2
+            {
+                "package": package_name,
+                "version": version,
+                "readme": docs["readme"],
+                "size": len(docs["readme"]),
+            },
+            indent=2,
         )
 
-    return json.dumps(
-        {
-            "package": package_name,
-            "version": version,
-            "readme": docs["readme"],
-            "size": len(docs["readme"]),
-        },
-        indent=2,
-    )
+    except ResourceError:
+        raise
+    except Exception as e:
+        await ctx.error(f"Failed to fetch README: {e}")
+        raise ResourceError(f"Failed to fetch README for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}/examples")
-def list_package_examples_resource(package_name: str, version: str) -> str:
-    """
-    List all example files (auto-fetches if not cached).
+@mcp.resource("typst://v1/packages/{package_name}/{version}/examples")
+async def list_package_examples_resource(package_name: str, version: str, ctx: Context) -> str:
+    """List all example files (auto-fetches if not cached).
 
     Returns list of examples with URIs for individual access.
 
     Lazy loading: First access fetches package data (~3-5s),
     subsequent accesses are instant (cached).
-
-    URI format: typst://package/{package_name}/{version}/examples
-    Example: typst://package/polylux/0.4.0/examples
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package_examples"] += 1
+    await ctx.debug(f"Accessing examples list resource: {package_name}@{version}")
 
-    # Try cache first
-    docs = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached
-    if docs is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} for examples")
-        try:
-            docs = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
+        # Try cache first
+        docs = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached
+        if docs is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} for examples")
+
+            # Run in thread pool (network I/O)
+            docs = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
+            )
+
+        examples = docs.get("examples", [])
+
+        if not examples:
+            await ctx.info(f"No examples available for {package_name}@{version}")
             return json.dumps(
                 {
-                    "error": f"Failed to fetch package: {str(e)}",
                     "package": package_name,
                     "version": version,
+                    "examples": [],
+                    "note": "This package has no examples directory",
                 },
                 indent=2,
             )
 
-    examples = docs.get("examples", [])
-
-    if not examples:
+        await ctx.info(f"Returning {len(examples)} examples")
         return json.dumps(
             {
                 "package": package_name,
                 "version": version,
-                "examples": [],
-                "note": "This package has no examples directory",
+                "examples": [
+                    {
+                        "filename": ex["filename"],
+                        "size": ex["size"],
+                        "uri": f"typst://v1/packages/{package_name}/{version}/examples/{ex['filename']}",
+                    }
+                    for ex in examples
+                ],
+                "count": len(examples),
             },
             indent=2,
         )
 
-    return json.dumps(
-        {
-            "package": package_name,
-            "version": version,
-            "examples": [
-                {
-                    "filename": ex["filename"],
-                    "size": ex["size"],
-                    "uri": f"typst://package/{package_name}/{version}/examples/{ex['filename']}",
-                }
-                for ex in examples
-            ],
-            "count": len(examples),
-        },
-        indent=2,
-    )
+    except Exception as e:
+        await ctx.error(f"Failed to list examples: {e}")
+        raise ResourceError(f"Failed to list examples for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}/examples/{filename}")
-def get_package_example_resource(package_name: str, version: str, filename: str) -> str:
-    """
-    Get specific example file content (auto-fetches if not cached).
+@mcp.resource("typst://v1/packages/{package_name}/{version}/examples/{filename}")
+async def get_package_example_resource(package_name: str, version: str, filename: str, ctx: Context) -> str:
+    """Get specific example file content (auto-fetches if not cached).
 
     Lazy loading: First access fetches package data (~3-5s),
     subsequent accesses are instant (cached).
-
-    URI format: typst://package/{package_name}/{version}/examples/{filename}
-    Example: typst://package/polylux/0.4.0/examples/demo.typ
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package_example_file"] += 1
+    await ctx.debug(f"Accessing example file resource: {package_name}@{version}/{filename}")
 
-    # Try cache first
-    docs = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached
-    if docs is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} for example file")
-        try:
-            docs = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"Failed to fetch package: {str(e)}",
-                    "package": package_name,
-                    "version": version,
-                },
-                indent=2,
+        # Try cache first
+        docs = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached
+        if docs is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} for example file")
+
+            # Run in thread pool (network I/O)
+            docs = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
             )
 
-    examples = docs.get("examples", [])
+        examples = docs.get("examples", [])
 
-    for ex in examples:
-        if ex["filename"] == filename:
-            return json.dumps(
-                {
-                    "package": package_name,
-                    "version": version,
-                    "filename": filename,
-                    "content": ex["content"],
-                    "size": ex["size"],
-                },
-                indent=2,
-            )
+        for ex in examples:
+            if ex["filename"] == filename:
+                await ctx.info(f"Returning example file ({ex['size']} bytes)")
+                return json.dumps(
+                    {
+                        "package": package_name,
+                        "version": version,
+                        "filename": filename,
+                        "content": ex["content"],
+                        "size": ex["size"],
+                    },
+                    indent=2,
+                )
 
-    return json.dumps(
-        {
-            "error": f"Example '{filename}' not found in {package_name}@{version}",
-            "available_examples": [ex["filename"] for ex in examples],
-        },
-        indent=2,
-    )
+        # File not found
+        available = [ex["filename"] for ex in examples]
+        await ctx.warning(f"Example '{filename}' not found")
+        raise ResourceError(
+            f"Example '{filename}' not found in {package_name}@{version}. "
+            f"Available examples: {', '.join(available) if available else 'none'}"
+        )
+
+    except ResourceError:
+        raise
+    except Exception as e:
+        await ctx.error(f"Failed to fetch example file: {e}")
+        raise ResourceError(f"Failed to fetch example file '{filename}' from '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}/docs")
-def list_package_docs_resource(package_name: str, version: str) -> str:
-    """
-    List all documentation files (auto-fetches if not cached).
+@mcp.resource("typst://v1/packages/{package_name}/{version}/docs")
+async def list_package_docs_resource(package_name: str, version: str, ctx: Context) -> str:
+    """List all documentation files (auto-fetches if not cached).
 
     Returns list of docs with URIs for individual access.
 
     Lazy loading: First access fetches package data (~3-5s),
     subsequent accesses are instant (cached).
-
-    URI format: typst://package/{package_name}/{version}/docs
-    Example: typst://package/tidy/0.4.3/docs
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package_docs_list"] += 1
+    await ctx.debug(f"Accessing docs list resource: {package_name}@{version}")
 
-    # Try cache first
-    docs_data = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached
-    if docs_data is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} for docs")
-        try:
-            docs_data = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
+        # Try cache first
+        docs_data = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached
+        if docs_data is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} for docs")
+
+            # Run in thread pool (network I/O)
+            docs_data = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
+            )
+
+        docs_files = docs_data.get("docs", {})
+
+        if not docs_files:
+            await ctx.info(f"No docs available for {package_name}@{version}")
             return json.dumps(
                 {
-                    "error": f"Failed to fetch package: {str(e)}",
                     "package": package_name,
                     "version": version,
+                    "docs": [],
+                    "note": "This package has no docs directory",
                 },
                 indent=2,
             )
 
-    docs_files = docs_data.get("docs", {})
-
-    if not docs_files:
+        await ctx.info(f"Returning {len(docs_files)} documentation files")
         return json.dumps(
             {
                 "package": package_name,
                 "version": version,
-                "docs": [],
-                "note": "This package has no docs directory",
+                "docs": [
+                    {
+                        "filename": filename,
+                        "size": len(content),
+                        "uri": f"typst://v1/packages/{package_name}/{version}/docs/{filename}",
+                    }
+                    for filename, content in docs_files.items()
+                ],
+                "count": len(docs_files),
             },
             indent=2,
         )
 
-    return json.dumps(
-        {
-            "package": package_name,
-            "version": version,
-            "docs": [
-                {
-                    "filename": filename,
-                    "size": len(content),
-                    "uri": f"typst://package/{package_name}/{version}/docs/{filename}",
-                }
-                for filename, content in docs_files.items()
-            ],
-            "count": len(docs_files),
-        },
-        indent=2,
-    )
+    except Exception as e:
+        await ctx.error(f"Failed to list docs: {e}")
+        raise ResourceError(f"Failed to list docs for '{package_name}@{version}': {e}") from e
 
 
-@mcp.resource("typst://package/{package_name}/{version}/docs/{filename}")
-def get_package_doc_file_resource(
-    package_name: str, version: str, filename: str
+@mcp.resource("typst://v1/packages/{package_name}/{version}/docs/{filename}")
+async def get_package_doc_file_resource(
+    package_name: str, version: str, filename: str, ctx: Context
 ) -> str:
-    """
-    Get specific documentation file content (auto-fetches if not cached).
+    """Get specific documentation file content (auto-fetches if not cached).
 
     Lazy loading: First access fetches package data (~3-5s),
     subsequent accesses are instant (cached).
-
-    URI format: typst://package/{package_name}/{version}/docs/{filename}
-    Example: typst://package/tidy/0.4.3/docs/migration.md
     """
-    from .package_docs import get_cached_package_docs, build_package_docs
+    _telemetry["resource_accesses"]["package_doc_file"] += 1
+    await ctx.debug(f"Accessing doc file resource: {package_name}@{version}/{filename}")
 
-    # Try cache first
-    docs_data = get_cached_package_docs(package_name, version)
+    try:
+        from .package_docs import get_cached_package_docs, build_package_docs
 
-    # Auto-fetch if not cached
-    if docs_data is None:
-        eprint(f"Resource: Auto-fetching {package_name}@{version} for doc file")
-        try:
-            docs_data = build_package_docs(package_name, version, timeout=30)
-        except Exception as e:
+        # Try cache first
+        docs_data = get_cached_package_docs(package_name, version)
+
+        # Auto-fetch if not cached
+        if docs_data is None:
+            await ctx.info(f"Auto-fetching {package_name}@{version} for doc file")
+
+            # Run in thread pool (network I/O)
+            docs_data = await anyio.to_thread.run_sync(
+                lambda: build_package_docs(package_name, version, timeout=30)
+            )
+
+        docs_files = docs_data.get("docs", {})
+
+        if filename in docs_files:
+            await ctx.info(f"Returning doc file ({len(docs_files[filename])} bytes)")
             return json.dumps(
                 {
-                    "error": f"Failed to fetch package: {str(e)}",
                     "package": package_name,
                     "version": version,
+                    "filename": filename,
+                    "content": docs_files[filename],
+                    "size": len(docs_files[filename]),
                 },
                 indent=2,
             )
 
-    docs_files = docs_data.get("docs", {})
-
-    if filename in docs_files:
-        return json.dumps(
-            {
-                "package": package_name,
-                "version": version,
-                "filename": filename,
-                "content": docs_files[filename],
-                "size": len(docs_files[filename]),
-            },
-            indent=2,
+        # File not found
+        available = list(docs_files.keys())
+        await ctx.warning(f"Doc file '{filename}' not found")
+        raise ResourceError(
+            f"Documentation file '{filename}' not found in {package_name}@{version}. "
+            f"Available docs: {', '.join(available) if available else 'none'}"
         )
 
-    return json.dumps(
-        {
-            "error": f"Documentation file '{filename}' not found in {package_name}@{version}",
-            "available_docs": list(docs_files.keys()),
-        },
-        indent=2,
-    )
+    except ResourceError:
+        raise
+    except Exception as e:
+        await ctx.error(f"Failed to fetch doc file: {e}")
+        raise ResourceError(f"Failed to fetch doc file '{filename}' from '{package_name}@{version}': {e}") from e
 
 
 # ============================================================================
@@ -1464,106 +1787,169 @@ def get_package_doc_file_resource(
 
 
 @mcp.tool()
-def search_packages(query: str, max_results: int = 20) -> str:
-    """
-    Search for packages in Typst Universe.
+async def search_packages(query: str, ctx: Context, max_results: int = 20) -> list[dict]:
+    """Search for packages in Typst Universe.
 
     Searches through available Typst packages and returns matching results.
     Useful for discovering packages before fetching their documentation.
 
     Args:
-        query: Search query to match against package names
-        max_results: Maximum number of results to return (default: 20)
+        query: Search query to match against package names (max 500 chars)
+        ctx: MCP context for logging
+        max_results: Maximum number of results to return (1-1000, default: 20)
 
     Returns:
-        JSON string containing list of matching packages with their names,
-        universe URLs, and import statements.
+        List of matching packages with names, URLs, and import statements
 
     Example:
-        Input: "cetz"
-        Output: JSON list with package info including import statement
+        Input: query="cetz"
+        Output: List with package info including import statement
     """
-    eprint(f"mcp.tool('search_packages') called with query: {query}")
+    _telemetry["tool_calls"]["search_packages"] += 1
+
+    # Input validation
+    if len(query) > MAX_QUERY_LENGTH:
+        await ctx.error(f"Query too long: {len(query)} chars")
+        raise ToolError(f"Query too long: {len(query)} chars (max {MAX_QUERY_LENGTH} chars)", code=-32003)
+
+    if max_results < 1 or max_results > MAX_RESULTS:
+        await ctx.warning(f"max_results out of range, clamping to 1-{MAX_RESULTS}")
+        max_results = max(1, min(max_results, MAX_RESULTS))
+
+    await ctx.debug(f"Searching packages: '{query}' (max {max_results} results)")
 
     try:
         from .package_docs import search_packages as _search_packages
 
-        results = _search_packages(query, max_results)
-        return json.dumps(results, indent=2)
+        # Run in thread pool (may do I/O)
+        results = await anyio.to_thread.run_sync(lambda: _search_packages(query, max_results))
+
+        await ctx.info(f"Found {len(results)} matching packages")
+        return results
 
     except Exception as e:
-        eprint(f"Error in search_packages: {e}")
-        return json.dumps({"error": str(e)})
+        _telemetry["errors"]["search_packages"] += 1
+        await ctx.error(f"Package search failed: {e}")
+        raise ToolError(f"Failed to search packages: {e}", code=-32001) from e
 
 
 @mcp.tool()
-def list_packages() -> str:
-    """
-    List all available packages in Typst Universe.
+async def list_packages(ctx: Context, offset: int = 0, limit: int = 100) -> dict:
+    """List all available packages in Typst Universe with pagination.
 
-    Returns a complete list of all packages available in the Typst Universe.
+    Returns packages available in the Typst Universe with pagination support.
     Use search_packages() for filtered results.
 
-    Returns:
-        JSON string containing list of all package names
+    Args:
+        ctx: MCP context for logging
+        offset: Number of packages to skip (default: 0)
+        limit: Maximum number of packages to return (1-1000, default: 100)
 
-    Example output: ["cetz", "tidy", "mantys", "polylux", ...]
+    Returns:
+        Dictionary containing:
+        - packages: List of package names
+        - total: Total number of packages
+        - offset: Current offset
+        - limit: Current limit
+        - has_more: Whether there are more packages
+
+    Example output:
+        {
+            "packages": ["cetz", "tidy", ...],
+            "total": 900,
+            "offset": 0,
+            "limit": 100,
+            "has_more": true
+        }
     """
-    eprint("mcp.tool('list_packages') called")
+    _telemetry["tool_calls"]["list_packages"] += 1
+
+    # Validate pagination parameters
+    if offset < 0:
+        offset = 0
+    if limit < 1 or limit > MAX_RESULTS:
+        await ctx.warning(f"limit out of range, clamping to 1-{MAX_RESULTS}")
+        limit = max(1, min(limit, MAX_RESULTS))
+
+    await ctx.debug(f"Listing packages (offset={offset}, limit={limit})")
 
     try:
         from .package_docs import list_all_packages
 
-        packages = list_all_packages()
-        return json.dumps(packages, indent=2)
+        # Run in thread pool
+        all_packages = await anyio.to_thread.run_sync(list_all_packages)
+        total = len(all_packages)
+
+        # Apply pagination
+        end = offset + limit
+        page_packages = all_packages[offset:end]
+        has_more = end < total
+
+        await ctx.info(f"Returning {len(page_packages)} of {total} packages (offset={offset})")
+
+        return {
+            "packages": page_packages,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+        }
 
     except Exception as e:
-        eprint(f"Error in list_packages: {e}")
-        return json.dumps({"error": str(e)})
+        _telemetry["errors"]["list_packages"] += 1
+        await ctx.error(f"Failed to list packages: {e}")
+        raise ToolError(f"Failed to list packages: {e}", code=-32001) from e
 
 
 @mcp.tool()
-def get_package_versions(package_name: str) -> str:
-    """
-    Get available versions for a Typst package.
+async def get_package_versions(package_name: str, ctx: Context) -> list[str]:
+    """Get available versions for a Typst package.
 
     Fetches all published versions of a package from Typst Universe.
     Versions are returned in descending order (latest first).
 
     Args:
         package_name: Name of the package (e.g., "cetz", "tidy")
+        ctx: MCP context for logging
 
     Returns:
-        JSON string containing list of available versions
+        List of available versions (e.g., ["0.2.2", "0.2.1", "0.2.0", ...])
 
     Example:
-        Input: "cetz"
+        Input: package_name="cetz"
         Output: ["0.2.2", "0.2.1", "0.2.0", ...]
     """
-    eprint(f"mcp.tool('get_package_versions') called with package: {package_name}")
+    _telemetry["tool_calls"]["get_package_versions"] += 1
+    await ctx.debug(f"Fetching versions for: {package_name}")
 
     try:
         from .package_docs import get_package_versions as _get_versions
 
-        versions = _get_versions(package_name, timeout=15)
-        return json.dumps(versions, indent=2)
+        # Run in thread pool (network I/O)
+        versions = await anyio.to_thread.run_sync(lambda: _get_versions(package_name, timeout=15))
+
+        await ctx.info(f"Found {len(versions)} versions for {package_name}")
+        return versions
 
     except RuntimeError as e:
-        return json.dumps({"error": str(e)})
+        _telemetry["errors"]["get_package_versions"] += 1
+        await ctx.error(f"Failed to get versions: {e}")
+        raise ToolError(f"Failed to get package versions: {e}", code=-32001) from e
     except Exception as e:
-        eprint(f"Error in get_package_versions: {e}")
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
+        _telemetry["errors"]["get_package_versions"] += 1
+        await ctx.error(f"Unexpected error: {e}")
+        raise ToolError(f"Unexpected error while fetching versions: {e}", code=-32001) from e
 
 
 @mcp.tool()
-def get_package_docs(
-    package_name: str, version: str | None = None, summary: bool = False
-) -> str:
-    """
-    Fetch documentation for a Typst Universe package.
+async def get_package_docs(
+    package_name: str, ctx: Context, version: str | None = None, summary: bool = False
+) -> dict:
+    """Fetch documentation for a Typst Universe package.
 
     Args:
         package_name: Package name (e.g., "cetz", "tidy", "polylux")
+        ctx: MCP context for logging
         version: Version (defaults to latest)
         summary: If True, returns only metadata and file listings without full content
 
@@ -1585,30 +1971,30 @@ def get_package_docs(
         2. Use get_package_file() to fetch specific files as needed
 
     Returns:
-        JSON string with package documentation or summary
+        Dictionary with package documentation or summary
 
-    Error handling:
-        - Package not found: Returns {"error": "Package 'name' not found..."}
-        - Network timeout: Returns {"error": "Timeout while fetching..."}
-        - Invalid version: Returns {"error": "Version 'x.y.z' not found..."}
+    Raises:
+        ToolError: If package not found, network timeout, or invalid version
 
     Example:
         Input: package_name="cetz", summary=True
-        Output: Lightweight summary with file listings (~5KB vs 50KB+)
+        Output: Lightweight summary dict with file listings (~5KB vs 50KB+)
     """
-    eprint(
-        f"mcp.tool('get_package_docs') called: {package_name}@{version}, summary={summary}"
-    )
+    _telemetry["tool_calls"]["get_package_docs"] += 1
+    await ctx.debug(f"Fetching docs: {package_name}@{version}, summary={summary}")
 
     try:
         from .package_docs import build_package_docs
 
-        # Fetch package docs (with timeout handling built-in)
-        docs = build_package_docs(package_name, version, timeout=30)
+        # Run in thread pool (network I/O)
+        docs = await anyio.to_thread.run_sync(
+            lambda: build_package_docs(package_name, version, timeout=30)
+        )
 
         if summary:
             # Return lightweight summary
-            summary_data = {
+            await ctx.info(f"Returning summary for {package_name}@{docs['version']}")
+            return {
                 "package": docs["package"],
                 "version": docs["version"],
                 "metadata": docs["metadata"],
@@ -1637,31 +2023,26 @@ def get_package_docs(
                 "repository_url": docs.get("repository_url"),
                 "note": "Use summary=false for full content, or get_package_file() for specific files",
             }
-            return json.dumps(summary_data, indent=2)
 
-        return json.dumps(docs, indent=2)
+        await ctx.info(f"Returning full docs for {package_name}@{docs['version']}")
+        return docs
 
     except RuntimeError as e:
-        # Handle expected errors (package not found, timeout, etc.)
-        eprint(f"Error fetching package docs: {e}")
-        return json.dumps({"error": str(e)})
-
+        _telemetry["errors"]["get_package_docs"] += 1
+        await ctx.error(f"Failed to fetch docs: {e}")
+        raise ToolError(f"Failed to fetch package docs: {e}", code=-32001) from e
     except Exception as e:
-        # Handle unexpected errors
-        eprint(f"Unexpected error in get_package_docs: {e}")
-        return json.dumps(
-            {
-                "error": f"Unexpected error while fetching package documentation: {str(e)}",
-                "package": package_name,
-                "version": version,
-            }
-        )
+        _telemetry["errors"]["get_package_docs"] += 1
+        await ctx.error(f"Unexpected error: {e}")
+        raise ToolError(
+            f"Unexpected error while fetching package documentation: {e}",
+            code=-32001,
+        ) from e
 
 
 @mcp.tool()
-def get_package_file(package_name: str, version: str, file_path: str) -> str:
-    """
-    Fetch a specific file from a Typst package.
+async def get_package_file(package_name: str, version: str, file_path: str, ctx: Context) -> dict:
+    """Fetch a specific file from a Typst package.
 
     Enables granular access to individual files within a package without
     fetching all documentation. Use after get_package_docs(summary=True)
@@ -1671,57 +2052,52 @@ def get_package_file(package_name: str, version: str, file_path: str) -> str:
         package_name: Package name (e.g., "cetz")
         version: Package version (e.g., "0.2.2")
         file_path: Path within package (e.g., "examples/basic.typ", "docs/guide.md")
+        ctx: MCP context for logging
 
     Returns:
-        JSON with file content or error message
+        Dictionary with file content
 
-    Error handling:
-        - File not found: Returns {"error": "File 'path' not found..."}
-        - Network error: Returns {"error": "..."}
+    Raises:
+        ToolError: If file not found or network error
 
     Example:
         Input: package_name="cetz", version="0.2.2", file_path="examples/plot.typ"
         Output: {"package": "cetz", "version": "0.2.2", "file_path": "...", "content": "..."}
     """
-    eprint(f"mcp.tool('get_package_file') called: {package_name}@{version}/{file_path}")
+    _telemetry["tool_calls"]["get_package_file"] += 1
+    await ctx.debug(f"Fetching file: {package_name}@{version}/{file_path}")
 
     try:
         from .package_docs import fetch_file_from_github
 
-        content = fetch_file_from_github(package_name, version, file_path, timeout=10)
+        # Run in thread pool (network I/O)
+        content = await anyio.to_thread.run_sync(
+            lambda: fetch_file_from_github(package_name, version, file_path, timeout=10)
+        )
 
         if content is None:
-            return json.dumps(
-                {
-                    "error": f"File '{file_path}' not found in package '{package_name}@{version}'",
-                    "package": package_name,
-                    "version": version,
-                    "file_path": file_path,
-                    "note": "Check that the file path is correct. Use get_package_docs(summary=True) to see available files.",
-                }
+            raise ToolError(
+                f"File '{file_path}' not found in package '{package_name}@{version}'. "
+                f"Use get_package_docs(summary=True) to see available files.",
+                code=-32001,
             )
 
-        return json.dumps(
-            {
-                "package": package_name,
-                "version": version,
-                "file_path": file_path,
-                "content": content,
-                "size": len(content),
-            },
-            indent=2,
-        )
+        await ctx.info(f"Fetched file ({len(content)} bytes)")
+        return {
+            "package": package_name,
+            "version": version,
+            "file_path": file_path,
+            "content": content,
+            "size": len(content),
+        }
 
+    except ToolError:
+        _telemetry["errors"]["get_package_file"] += 1
+        raise
     except Exception as e:
-        eprint(f"Error in get_package_file: {e}")
-        return json.dumps(
-            {
-                "error": str(e),
-                "package": package_name,
-                "version": version,
-                "file_path": file_path,
-            }
-        )
+        _telemetry["errors"]["get_package_file"] += 1
+        await ctx.error(f"Failed to fetch file: {e}")
+        raise ToolError(f"Failed to fetch package file: {e}", code=-32001) from e
 
 
 @mcp.prompt()
@@ -1986,9 +2362,10 @@ def _get_pdf_tool_description():
     return full_description
 
 
-def main():
-    """Entry point for the MCP server."""
+async def async_main():
+    """Async entry point for the MCP server."""
     import atexit
+    import asyncio
 
     # Check dependencies on startup
     check_dependencies()
@@ -2024,7 +2401,7 @@ def main():
 
     atexit.register(cleanup_all_pdfs)
 
-    # Start background thread to build/load docs
+    # Log startup info
     logger.info("Starting Typst MCP Server...")
     logger.info("")
     logger.info("Tools available immediately:")
@@ -2033,27 +2410,36 @@ def main():
         "  - Syntax validation: check_if_snippet_is_valid_typst_syntax, check_if_snippets_are_valid_typst_syntax"
     )
     logger.info("  - Image rendering: typst_snippet_to_image")
+    logger.info("  - PDF generation: typst_snippet_to_pdf")
     logger.info("  - Package search: search_packages, list_packages, get_package_versions")
     logger.info("  - Package docs: get_package_docs (fetches on-demand)")
     logger.info("")
     logger.info("Resources available:")
-    logger.info("  - typst://packages/cached - List of all cached package docs")
-    logger.info("  - typst://package/{name}/{version} - Cached package documentation")
+    logger.info("  - typst://v1/ - Root resource index")
+    logger.info("  - typst://v1/packages/cached - List of all cached package docs")
+    logger.info("  - typst://v1/packages/{name}/{version} - Cached package documentation")
     logger.info("")
     logger.info("Core documentation tools will be available after docs are loaded/built...")
     logger.info("")
 
-    # Wrapper to run async build_docs_background in a thread
-    def run_async_docs_build():
-        """Wrapper to run async function in thread."""
-        import asyncio
-        asyncio.run(build_docs_background(None))
+    # Start docs build as background task (proper async, no threading)
+    async def build_docs_task():
+        """Build docs in background without blocking server startup."""
+        try:
+            await build_docs_background(None)
+        except Exception as e:
+            logger.error(f"Background docs build failed: {e}")
 
-    doc_thread = threading.Thread(target=run_async_docs_build, daemon=True)
-    doc_thread.start()
+    asyncio.create_task(build_docs_task())
 
-    # Run the server
-    mcp.run()
+    # Run the server asynchronously
+    await mcp.run_async()
+
+
+def main():
+    """Entry point for the MCP server."""
+    import asyncio
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

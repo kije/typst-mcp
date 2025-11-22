@@ -1,7 +1,22 @@
-"""Pydantic models for Typst MCP Server responses."""
+"""Pydantic models for Typst MCP Server responses and tool parameters."""
 
-from typing import Any
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+from pydantic import BaseModel, Field, field_validator
+import re
+
+# ============================================================================
+# VALIDATION CONSTANTS
+# ============================================================================
+
+# Maximum snippet sizes (to prevent DoS via memory exhaustion)
+MAX_SNIPPET_LENGTH = 100_000  # 100KB for code snippets
+MAX_LATEX_SNIPPET_LENGTH = 50_000  # 50KB for LaTeX (Pandoc can be slow)
+MAX_QUERY_LENGTH = 500  # 500 chars for search queries
+MAX_RESULTS = 1000  # Maximum search results
+
+# Timeouts
+DEFAULT_VALIDATION_TIMEOUT = 30  # seconds
+DEFAULT_CONVERSION_TIMEOUT = 60  # seconds
 
 
 class ChapterInfo(BaseModel):
@@ -109,3 +124,144 @@ class ConversionResult(BaseModel):
     success: bool
     typst_code: str | None = None
     error_message: str | None = None
+
+
+# ============================================================================
+# TOOL PARAMETER MODELS
+# ============================================================================
+
+
+class LaTeXSnippetParams(BaseModel):
+    """Parameters for latex_snippet_to_typst tool."""
+
+    latex_snippet: str = Field(
+        ...,
+        description="LaTeX code to convert to Typst",
+        min_length=1,
+        max_length=MAX_LATEX_SNIPPET_LENGTH,
+    )
+
+    @field_validator("latex_snippet")
+    @classmethod
+    def validate_length(cls, v: str) -> str:
+        """Validate snippet length to prevent DoS."""
+        if len(v) > MAX_LATEX_SNIPPET_LENGTH:
+            raise ValueError(
+                f"LaTeX snippet too large: {len(v)} bytes (max {MAX_LATEX_SNIPPET_LENGTH} bytes)"
+            )
+        return v
+
+
+class TypstSnippetParams(BaseModel):
+    """Parameters for Typst snippet validation/rendering tools."""
+
+    typst_snippet: str = Field(
+        ...,
+        description="Typst code to validate or render",
+        min_length=1,
+        max_length=MAX_SNIPPET_LENGTH,
+    )
+
+    @field_validator("typst_snippet")
+    @classmethod
+    def validate_length(cls, v: str) -> str:
+        """Validate snippet length to prevent DoS."""
+        if len(v) > MAX_SNIPPET_LENGTH:
+            raise ValueError(
+                f"Typst snippet too large: {len(v)} bytes (max {MAX_SNIPPET_LENGTH} bytes)"
+            )
+        return v
+
+
+class TypstPDFParams(BaseModel):
+    """Parameters for typst_snippet_to_pdf tool."""
+
+    typst_snippet: str = Field(
+        ...,
+        description="Typst code to compile to PDF",
+        min_length=1,
+        max_length=MAX_SNIPPET_LENGTH,
+    )
+    output_mode: Literal["embedded", "path"] = Field(
+        default="embedded",
+        description='Output mode: "embedded" (return PDF data) or "path" (save to file)',
+    )
+    output_path: str | None = Field(
+        default=None,
+        description="Custom output path (only for path mode, must be in allowed directories)",
+    )
+
+    @field_validator("typst_snippet")
+    @classmethod
+    def validate_snippet_length(cls, v: str) -> str:
+        """Validate snippet length."""
+        if len(v) > MAX_SNIPPET_LENGTH:
+            raise ValueError(
+                f"Typst snippet too large: {len(v)} bytes (max {MAX_SNIPPET_LENGTH} bytes)"
+            )
+        return v
+
+
+class PackageDocsParams(BaseModel):
+    """Parameters for get_package_docs tool."""
+
+    package_name: str = Field(
+        ...,
+        description="Package name (e.g., 'cetz', 'tidy')",
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    version: str | None = Field(
+        None,
+        description="Package version (semver, e.g., '0.2.2')",
+        pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$",
+    )
+    summary: bool = Field(
+        default=False, description="Return lightweight summary instead of full docs"
+    )
+
+
+class PackageFileParams(BaseModel):
+    """Parameters for get_package_file tool."""
+
+    package_name: str = Field(
+        ...,
+        description="Package name",
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    version: str = Field(
+        ...,
+        description="Package version (semver)",
+        pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$",
+    )
+    file_path: str = Field(
+        ..., description="File path within package (e.g., 'examples/basic.typ')"
+    )
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_file_path(cls, v: str) -> str:
+        """Validate file path to prevent path traversal."""
+        if ".." in v or v.startswith("/"):
+            raise ValueError("Invalid file path: path traversal detected")
+        return v
+
+
+class SearchPackagesParams(BaseModel):
+    """Parameters for search_packages tool."""
+
+    query: str = Field(
+        ...,
+        description="Search query to match against package names",
+        min_length=1,
+        max_length=MAX_QUERY_LENGTH,
+    )
+    max_results: int = Field(
+        default=20,
+        description="Maximum number of results to return",
+        ge=1,
+        le=MAX_RESULTS,
+    )
